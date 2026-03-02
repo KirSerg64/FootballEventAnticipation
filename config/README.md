@@ -1,0 +1,57 @@
+# Setting up the Configurations
+
+Here we describe the different parameters set in each configuration file:
+
+- _frame_dir:_ Directory where frames are stored.
+- _save_dir:_ Directory to save model checkpoints, predictions, etc.
+- _store_dir:_ Directory to save dataset information.
+- _store_mode:_ 'store' if it's the first time running the script to prepare and store dataset information, or 'load' to load previously stored information.
+- _batch_size:_ Batch size.
+- _clip_len:_ Length of the clips in number of frames. Includes both observation and anticipation, meaning that it is essentially: observation frames + anticipation frames
+- _dataset:_ Name of the dataset ('soccernet', 'soccernetball', 'soccernetballanticipation').
+- _radi_smoothing:_ Radius of label smoothing in auxiliary segmentation task.
+- _excluded_classes:_ Classes to be excluded from training and prediction
+- _class_weights:_ Weights of classes including background class
+- _eos_weight:_ Weight of the end of sequence token
+- _offset_loss_weight:_ Weight of the offset loss
+- _epoch_num_frames:_ Number of frames used per epoch.
+- _feature_arch:_ Name of the backbone feature extractor ('rny002_gsf', 'rny004_gsf', 'rny006_gsf' or 'rny008_gsf').
+- _learning_rate:_ Learning rate.
+- _num_epochs:_ Number of epochs for training.
+- _warm_up_epochs:_ Number of warm-up epochs.
+- _start_map_epoch:_ Epoch where mAP validation and model saving begins.
+- _temporal_arch:_ Temporal architecture used ('ed_sgp_mixer', 'none').
+- _n_layers:_ Number of blocks/layers used for the temporal architecture.
+- _sgp_ks:_ Kernel size of the SGP and SGP-Mixer layers.
+- _sgp_r:_ $r$ factor in SGP and SGP-Mixer layers.
+- _num_workers:_ Number of workers.
+- _weight_decay:_ Weight decay in the optimizer.
+- _obs_perc:_ Percentage of the clip to use for observation frames.
+- _test_obs_perc:_ Percentage of the clip to use for observation frames when evaluating.
+- _pred_perc:_ Percentage of the clip to anticipate, only frames after observation frames.
+- _n_query:_ Number of queries to use in transformer decoder
+- _seg:_ Train with auxiliary segmentation task.
+- _anticipate:_ Add or remove anticipation capabilities from the model.
+- _actionness:_ Use actionness when performing the anticipation task.
+- _n_head:_ Number of heads in the transformer.
+- _hidden_dim:_ The hidden dimension in the FC layers in the transformer.
+- _n_encoder_layer:_ Number of layers in the transformer encoder.
+- _n_decoder_layer:_ Number of layers in the transformer decoder.
+- _mask_attn:_ Mask the attention window.
+- _mask_attn_window_src:_ Masking window in the transformer encoder.
+- _mask_attn_window_tgt:_ Masking window in the transformer decoder.
+- _wand_mode:_ Mode of the wandb logging. "online", "offline" or "disabled".
+- _use_jointtrain:_ Perform joint-training by doing joint training of two dataset.
+- _wandb_mode:_ Wandb logging mode. Can be "online", "offline" or "disabled"
+- _jointtrain:_ The arguments when doing joint training:
+  - _frame_dir:_ Directory where frames are stored (dual dataset).
+  - _store_dir:_ Directory to save dataset information (dual dataset).
+  - _dataset:_ Name of the dual dataset ('soccernet', 'soccernetball').
+  - _num_classes:_ Number of classes in the dual dataset.
+  - _class_weights:_ Weights of classes including background class in the dual dataset.
+  - _eos_weight:_ Weight of the end of sequence token for the dual dataset.
+- _loss_func:_ Loss function to use. Default is CrossEntropy
+- _CALF_matching:_ Use CALF matching for loss calculation. Can also be called offset matching
+- _CALF_probability_matching:_ Does CALF matching with probability instead of offset
+- _anticipate_background:_ Anticipate background class instead of EOS. Uses EOS weight for background loss weighting
+- _use_anchors:_ Use anchors for anticipation instead of predicting the frame

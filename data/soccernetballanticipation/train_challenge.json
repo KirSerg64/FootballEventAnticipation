@@ -1,0 +1,2 @@
+[{"video":"train", "num_frames": 3440250, "num_clips": 4587},
+ {"video":"test",  "num_frames": 1782000, "num_clips": 2376}]

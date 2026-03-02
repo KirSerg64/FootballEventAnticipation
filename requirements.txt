@@ -1,0 +1,9 @@
+numpy
+scipy
+torch
+einops
+timm
+SoccerNet
+wandb
+tabulate
+pyzipper
