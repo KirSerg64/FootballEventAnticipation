@@ -101,5 +101,13 @@ def update_args(args, config):
     args.mask_attn = config.get("mask_attn", False) # Mask attention for the transformer
     args.mask_attn_window_src = config.get("mask_attn_window_src", 0) # Window size for encoder attention masking
     args.mask_attn_window_tgt = config.get("mask_attn_window_tgt", 0) # Window size for decoder attention masking
-    
+
+    # Fraction of the 720p/train clips to use as training when the official train split is
+    # re-partitioned locally for validation purposes.  The remainder becomes the local val set.
+    # Set to null / None to use the standard train.json + val.json splits unchanged.
+    args.train_local_split = config.get("train_local_split", None)
+    if args.train_local_split is not None:
+        assert isinstance(args.train_local_split, float), "train_local_split must be a float"
+        assert 0.0 < args.train_local_split < 1.0, "train_local_split must be in (0, 1)"
+
     return args

@@ -6,6 +6,7 @@ data/soccernetball/england_efl
 data/soccernetball/LEN*
 data/soccernetball-big/england_efl
 data/soccernetball-big/LEN*
+data/soccernetballanticipation/720p
 *.log
 save/
 logs/
@@ -13,3 +14,4 @@ wandb/
 wandb_logs/
 T-Deed-Results/
 .vscode/
+.github/prompts

@@ -38,5 +38,6 @@
     "mask_attn_window_src": 15,
     "mask_attn_window_tgt": 19,
     "wandb_mode": "online",
-    "use_jointtrain": false
+    "use_jointtrain": false,
+    "train_local_split": null
 }

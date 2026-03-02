@@ -54,12 +54,23 @@ class ActionSpotDataset(Dataset):
             use_actionness = False,         # Use actionness instead of EOS
             use_anchors = False,            # Use temporal anchors for the model
             cheating_dataset = False,       # Cheating dataset that gives model anticipation frames instead of observed frames
-            cheating_range = None           # Range of video to provide when cheating
+            cheating_range = None,          # Range of video to provide when cheating
+            clip_idx_range = None           # (start, end) tuple restricting which clips from the label file are used.
+                                            # Enables splitting the 720p/train folder into train and local-val subsets
+                                            # without duplicating files.  None means use all clips.
             # TODO: Add a specific observation percentage when doing test dataset
     ):
         self._src_file = label_file
         self._labels = load_json(label_file)
-        self._split = label_file.split('/')[-1].split('.')[0]
+        base_split = label_file.split('/')[-1].split('.')[0]
+        # Append clip range to the split name so the pickle cache is unique per slice
+        if clip_idx_range is not None:
+            assert len(clip_idx_range) == 2 and clip_idx_range[0] < clip_idx_range[1], \
+                "clip_idx_range must be a (start, end) tuple with start < end"
+            self._split = f"{base_split}_clips{clip_idx_range[0]}_{clip_idx_range[1]}"
+        else:
+            self._split = base_split
+        self._clip_idx_range = clip_idx_range
         self._class_dict = classes
         self._n_class = n_class
         self._video_idxs = {x['video']: i for i, x in enumerate(self._labels)}
@@ -132,7 +143,9 @@ class ActionSpotDataset(Dataset):
             video_len = int(full_video_len * ((self._clip_len*self._stride/FPS_SN)+5)/30)
             labels_files = load_json(os.path.join(LABELS_SNBA_PATH, video['video'] + '/Labels-ball.json'))['videos']
 
-            for clip_idx in range(0,num_clips):
+            clip_start = self._clip_idx_range[0] if self._clip_idx_range is not None else 0
+            clip_end   = self._clip_idx_range[1] if self._clip_idx_range is not None else num_clips
+            for clip_idx in range(clip_start, clip_end):
                 labels_file = labels_files[clip_idx]['annotations']['observation'] + labels_files[clip_idx]['annotations']['anticipation']
                 for base_idx in range(-self._pad_len * self._stride, max(0, video_len - 1 + (2 * self._pad_len - self._clip_len) * self._stride), self._overlap):
 

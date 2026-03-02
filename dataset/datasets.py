@@ -43,38 +43,74 @@ def get_datasets(args, label_pad_idx, n_class):
         'cheating_range': args.cheating_range,
     }
 
+    # -----------------------------------------------------------------------
+    # Optional: re-partition the 720p/train folder into a local train / val
+    # split without moving any files.  Controlled by args.train_local_split.
+    # -----------------------------------------------------------------------
+    use_local_split = (
+        getattr(args, 'train_local_split', None) is not None
+        and args.dataset == 'soccernetballanticipation'
+    )
+
     # Create training dataset
     print('Dataset size:', dataset_len)
-    if args.cheating_dataset:
+    if use_local_split:
+        import json as _json
+        with open(os.path.join('data', args.dataset, 'train.json')) as _f:
+            _train_meta = _json.load(_f)
+        # train.json is a list with one entry {"video": "train", "num_clips": N, ...}
+        total_clips = int(_train_meta[0]['num_clips'])
+        split_idx = int(total_clips * args.train_local_split)
+        print(f'Local split: using clips 0–{split_idx} for training, '
+              f'{split_idx}–{total_clips} for local validation '
+              f'(train_local_split={args.train_local_split})')
         train_data = ActionSpotDataset(
             classes, os.path.join('data', args.dataset, 'train.json'),
-            args.frame_dir, args.store_dir, args.store_mode, 
+            args.frame_dir, args.store_dir, args.store_mode,
             args.clip_len, dataset_len,
-            label_pad_idx, n_class, **dataset_kwargs)
-        print("Cheating training dataset")
+            label_pad_idx, n_class,
+            clip_idx_range=(0, split_idx),
+            **dataset_kwargs)
+        train_data.print_info()
+        val_data = ActionSpotDataset(
+            classes, os.path.join('data', args.dataset, 'train.json'),
+            args.frame_dir, args.store_dir, args.store_mode,
+            args.clip_len, dataset_len // 4,
+            label_pad_idx, n_class,
+            clip_idx_range=(split_idx, total_clips),
+            **dataset_kwargs)
+        val_data.print_info()
     else:
-        train_data = ActionSpotDataset(
-            classes, os.path.join('data', args.dataset, 'train.json'),
-            args.frame_dir, args.store_dir, args.store_mode, 
-            args.clip_len, dataset_len,
-            label_pad_idx, n_class, **dataset_kwargs)
-    train_data.print_info()
+        if args.cheating_dataset:
+            train_data = ActionSpotDataset(
+                classes, os.path.join('data', args.dataset, 'train.json'),
+                args.frame_dir, args.store_dir, args.store_mode, 
+                args.clip_len, dataset_len,
+                label_pad_idx, n_class, **dataset_kwargs)
+            print("Cheating training dataset")
+        else:
+            train_data = ActionSpotDataset(
+                classes, os.path.join('data', args.dataset, 'train.json'),
+                args.frame_dir, args.store_dir, args.store_mode, 
+                args.clip_len, dataset_len,
+                label_pad_idx, n_class, **dataset_kwargs)
+        train_data.print_info()
 
-    # Create validation dataset
-    if args.cheating_dataset:
-        val_data = ActionSpotDataset(
-            classes, os.path.join('data', args.dataset, 'val.json'),
-            args.frame_dir, args.store_dir, args.store_mode,
-            args.clip_len, dataset_len // 4,
-            label_pad_idx, n_class, **dataset_kwargs)
-        print("Cheating validation dataset")
-    else:
-        val_data = ActionSpotDataset(
-            classes, os.path.join('data', args.dataset, 'val.json'),
-            args.frame_dir, args.store_dir, args.store_mode,
-            args.clip_len, dataset_len // 4,
-            label_pad_idx, n_class, **dataset_kwargs)
-    val_data.print_info()
+        # Create validation dataset
+        if args.cheating_dataset:
+            val_data = ActionSpotDataset(
+                classes, os.path.join('data', args.dataset, 'val.json'),
+                args.frame_dir, args.store_dir, args.store_mode,
+                args.clip_len, dataset_len // 4,
+                label_pad_idx, n_class, **dataset_kwargs)
+            print("Cheating validation dataset")
+        else:
+            val_data = ActionSpotDataset(
+                classes, os.path.join('data', args.dataset, 'val.json'),
+                args.frame_dir, args.store_dir, args.store_mode,
+                args.clip_len, dataset_len // 4,
+                label_pad_idx, n_class, **dataset_kwargs)
+        val_data.print_info()
 
     val_data_frames = None     
         
