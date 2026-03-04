@@ -50,7 +50,7 @@ def extract_split(split, download_key, download_path, delete_videos=False):
         os.remove(split_path)
         print(f"Deleted {split} zip file to save space")
 
-def export_clip(clip, delete_videos, low_res, download_path, frame_size):
+def export_clip(clip, delete_videos, low_res, download_path, frame_size, use_cuda=True):
     """
     Export frames from a single clip using the specified resolution.
     
@@ -68,10 +68,16 @@ def export_clip(clip, delete_videos, low_res, download_path, frame_size):
     video_path = Path(os.path.join(download_path, split, clip, resolution))
     print(f"Exporting {video_path}")
     # Change the resolution of the video if using 448p. Otherwise, use the original resolution
-    if frame_size == "448p":
-        subprocess.call(["ffmpeg", "-i", video_path, "-q:v", "1", "-vf", "scale=796x448", os.path.join(video_path.parent, "frame%d.jpg")])
+    if use_cuda:
+        if frame_size == "448p":
+            subprocess.call(["ffmpeg", "-hwaccel", "cuda", "-i", video_path, "-q:v", "1", "-vf", "scale=796x448", os.path.join(video_path.parent, "frame%d.jpg")])
+        else:
+            subprocess.call(["ffmpeg", "-hwaccel", "cuda", "-i", video_path, "-q:v", "1", "-vf", " scale=398x224", os.path.join(video_path.parent, "frame%d.jpg")])
     else:
-        subprocess.call(["ffmpeg", "-i", video_path, "-q:v", "1", os.path.join(video_path.parent, "frame%d.jpg")])
+        if frame_size == "448p":
+            subprocess.call(["ffmpeg", "-i", video_path, "-q:v", "1", "-vf", "scale=796x448", os.path.join(video_path.parent, "frame%d.jpg")])
+        else:
+            subprocess.call(["ffmpeg", "-i", video_path, "-q:v", "1", "-vf", "scale=398x224", os.path.join(video_path.parent, "frame%d.jpg")])
     # Delete video if deleting
     if delete_videos:
         if video_path.is_file():
@@ -101,7 +107,7 @@ def export_frames(split, download_path, delete_videos=False, frame_size="448p", 
         print(f"Could not find anything to export in the path {os.path.join(download_path, split)}")
         return
     with mp.Pool(num_cpus) as p:
-        p.starmap(export_clip, zip(clips, repeat(delete_videos), repeat(low_res), repeat(download_path), repeat(frame_size)))
+        p.starmap(export_clip, zip(clips, repeat(delete_videos), repeat(low_res), repeat(download_path), repeat(frame_size), repeat(args.use_cuda)))
         
 
 
@@ -163,6 +169,13 @@ if __name__ == "__main__":
         help="Number of CPUs to use when exporting clips"
 
     )
+    parser.add_argument(
+        "--use-cuda",
+        type=bool,
+        default=True,
+        help="Whether to use CUDA when exporting clips"
+
+    )    
     args = parser.parse_args()
     print("Supplied arguments:", args)
     frame_size_path = "224p" if args.frame_size == "224p" else "720p"
@@ -185,4 +198,4 @@ if __name__ == "__main__":
         if not args.export_only:
             download_split(split, args.download_path, frame_size_path)
             extract_split(split, args.download_key, os.path.join(args.download_path, frame_size_path), args.delete_videos)
-        export_frames(split, os.path.join(args.download_path, frame_size_path), args.delete_videos, args.frame_size, args.cpus)
+        export_frames(split, os.path.join(args.download_path, frame_size_path), args.delete_videos, args.frame_size, args.cpus, args.use_cuda)
