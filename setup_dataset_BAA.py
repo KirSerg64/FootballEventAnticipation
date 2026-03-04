@@ -84,7 +84,7 @@ def export_clip(clip, delete_videos, low_res, download_path, frame_size, use_cud
             os.remove(video_path)
             print(f"Deleted {video_path} to save space")
 
-def export_frames(split, download_path, delete_videos=False, frame_size="448p", num_cpus=4):
+def export_frames(split, download_path, delete_videos=False, frame_size="448p", num_cpus=4, use_cuda=True):
     """
     Export frames from the specified split of the dataset using the specified resolution.
     Exports multiple clips in parallel
@@ -107,7 +107,7 @@ def export_frames(split, download_path, delete_videos=False, frame_size="448p", 
         print(f"Could not find anything to export in the path {os.path.join(download_path, split)}")
         return
     with mp.Pool(num_cpus) as p:
-        p.starmap(export_clip, zip(clips, repeat(delete_videos), repeat(low_res), repeat(download_path), repeat(frame_size), repeat(args.use_cuda)))
+        p.starmap(export_clip, zip(clips, repeat(delete_videos), repeat(low_res), repeat(download_path), repeat(frame_size), repeat(use_cuda)))
         
 
 
@@ -171,8 +171,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use-cuda",
-        type=bool,
-        default=True,
+        action="store_true",
         help="Whether to use CUDA when exporting clips"
 
     )    
