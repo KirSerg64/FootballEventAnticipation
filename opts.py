@@ -45,6 +45,7 @@ def update_args(args, config):
     # Arguments for FUTR compatibility
     args.epochs = config["num_epochs"]
     args.lr = config["learning_rate"]                   # FUTR's default is 0.001, while T-Deed's is 0.0008
+    args.optimizer = config.get("optimizer", "adamw") # Optimizer to use. Can be "adamw" or "muon". Default is adamw. Note that muon is not included in the requirements.txt and needs to be installed separately if you want to use it.
     # T-Deed just used default weight decay
     args.weight_decay = config["weight_decay"]
     args.obs_perc = config["obs_perc"]      # Percentage of clip_len to use for observation

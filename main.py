@@ -111,7 +111,12 @@ def main():
 
     model = nn.DataParallel(model).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == "muon":
+        optimizer = torch.optim.Muon(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    else:    
+        raise ValueError("Unsupported optimizer. Choose between 'adamw' and 'muon'.")
     criterion = nn.MSELoss(reduction = 'none')  # Criterion is used for offset loss
 
     # Training
