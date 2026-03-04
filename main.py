@@ -19,6 +19,39 @@ from dataset.datasets import get_datasets
 
 device = torch.device('cuda')
 
+
+class _DualOptimizer:
+    """Proxy that runs Muon for >=2-D parameters and AdamW for 1-D parameters
+    (biases, layer-norm scales, etc.) behind a single optimizer interface.
+
+    The LR scheduler is attached via ``param_groups``, which is aliased to the
+    inner AdamW param_groups so that LR warm-up / cosine annealing applies to
+    that optimizer.  Muon uses its own effective LR scaling internally.
+    """
+
+    def __init__(self, muon_opt, adamw_opt):
+        self._muon = muon_opt
+        self._adamw = adamw_opt
+        # Expose AdamW param_groups so LR schedulers (LinearLR, CosineAnnealingLR)
+        # and LR logging (optimizer.param_groups[0]['lr']) work transparently.
+        self.param_groups = adamw_opt.param_groups
+
+    def zero_grad(self, set_to_none: bool = True):
+        self._muon.zero_grad(set_to_none=set_to_none)
+        self._adamw.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        self._muon.step(closure)
+        self._adamw.step(closure)
+
+    def state_dict(self):
+        return {'muon': self._muon.state_dict(), 'adamw': self._adamw.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self._muon.load_state_dict(state_dict['muon'])
+        self._adamw.load_state_dict(state_dict['adamw'])
+
+
 def get_lr_scheduler(args, optimizer, num_steps_per_epoch):
     cosine_epochs = args.epochs - args.warm_up_epochs
     print('Using Linear Warmup ({}) + Cosine Annealing LR ({})'.format(
@@ -114,7 +147,13 @@ def main():
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
     elif args.optimizer == "muon":
-        optimizer = torch.optim.Muon(model.parameters(), args.lr, weight_decay=args.weight_decay)
+        # Muon is designed for matrix-shaped (ndim >= 2) parameters.
+        # 1-D parameters (biases, layer-norm weights/biases) are handled by AdamW.
+        muon_params  = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+        adamw_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+        _muon_opt  = torch.optim.Muon(muon_params, lr=args.lr, weight_decay=args.weight_decay)
+        _adamw_opt = torch.optim.AdamW(adamw_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = _DualOptimizer(_muon_opt, _adamw_opt)
     else:    
         raise ValueError("Unsupported optimizer. Choose between 'adamw' and 'muon'.")
     criterion = nn.MSELoss(reduction = 'none')  # Criterion is used for offset loss
