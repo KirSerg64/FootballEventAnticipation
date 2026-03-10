@@ -1,0 +1,10 @@
+# Core dependencies for the pose estimation module
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.7.0
+numpy>=1.24.0
+
+# Optional: BBoxMaskPose backend
+# pip install openmim
+# mim install mmcv mmdet mmpose
+# git clone https://github.com/MiraPurkrabek/BBoxMaskPose.git && cd BBoxMaskPose && pip install -e .

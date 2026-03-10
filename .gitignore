@@ -1,0 +1,4 @@
+# Generated output videos — do not commit
+output/pose_visualization.mp4
+output/*.mp4
+output/*.avi
