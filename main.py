@@ -20,7 +20,7 @@ from dataset.datasets import get_datasets
 device = torch.device('cuda')
 
 
-class _DualOptimizer:
+class _DualOptimizer(torch.optim.Optimizer):
     """Proxy that runs Muon for >=2-D parameters and AdamW for 1-D parameters
     (biases, layer-norm scales, etc.) behind a single optimizer interface.
 
@@ -149,8 +149,8 @@ def main():
     elif args.optimizer == "muon":
         # Muon is designed for matrix-shaped (ndim >= 2) parameters.
         # 1-D parameters (biases, layer-norm weights/biases) are handled by AdamW.
-        muon_params  = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-        adamw_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+        muon_params  = [p for p in model.parameters() if p.requires_grad and p.ndim == 2]
+        adamw_params = [p for p in model.parameters() if p.requires_grad and p.ndim != 2]
         _muon_opt  = torch.optim.Muon(muon_params, lr=args.lr, weight_decay=args.weight_decay)
         _adamw_opt = torch.optim.AdamW(adamw_params, lr=args.lr, weight_decay=args.weight_decay)
         optimizer = _DualOptimizer(_muon_opt, _adamw_opt)

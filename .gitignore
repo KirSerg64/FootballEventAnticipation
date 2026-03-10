@@ -15,3 +15,4 @@ wandb_logs/
 T-Deed-Results/
 .vscode/
 .github/prompts
+data/output
