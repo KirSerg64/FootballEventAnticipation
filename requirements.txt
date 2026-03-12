@@ -1,0 +1,12 @@
+# Core ML framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Ultralytics – provides YOLO detection, YOLO pose, SAM / SAM2 segmentation,
+# and the SAM2VideoPredictor used for video-based tracking.
+ultralytics>=8.3.0
+
+# Computer vision & numerics
+opencv-python>=4.8.0
+numpy>=1.24.0
+scipy>=1.10.0
