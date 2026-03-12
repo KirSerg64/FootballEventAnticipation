@@ -21,9 +21,22 @@ Architecture (updated)
    bboxes before IoU matching, preventing ID switches caused by camera panning
    or zooming.
 
-4. The **ball** is tracked with a constant-velocity Kalman filter
-   (``BallKalmanFilter``) so that the reported ball position is smooth and
-   survives short missed detections.
+4. The **ball** is tracked with an **Adaptive Constant-Acceleration (CA)
+   Kalman filter** (``BallKalmanFilter``).  Compared to the earlier
+   constant-velocity filter, this model:
+
+   * Tracks position, velocity *and* acceleration, so it responds within
+     1–2 frames after a sudden kick or bounce (CA state carries the new
+     direction forward automatically).
+   * Uses the DWNA (Discrete White-Noise Acceleration) Q matrix calibrated
+     to the expected ball manoeuvre magnitude (``ball_sigma_acc = 30``
+     px/frame² by default; Q_vel ≈ 900×larger than the old CV filter).
+   * Applies NIS-based adaptive Q scaling: when the normalised innovation
+     squared exceeds the chi² 95 % threshold the process noise is temporarily
+     boosted by up to 50×, allowing sub-2-frame recovery from kicks.
+   * Gates false YOLO detections via the Mahalanobis distance (chi² 99 %,
+     2 DOF = 9.21), preventing spurious hits from corrupting the velocity
+     and acceleration states.
 
 5. **Re-detection** every ``redetect_interval`` frames picks up players who
    enter the scene after frame 0.  All matching in the re-detection path also
@@ -154,6 +167,15 @@ class SegmentationTracker:
         When *True*, estimate frame-to-frame ORB+RANSAC homography and warp
         previous-frame bboxes before IoU matching in the fallback path to
         compensate for camera motion.
+    ball_sigma_acc:
+        Standard deviation of the ball acceleration disturbance (px/frame²)
+        used by the Adaptive CA Kalman filter.  Increase for faster / more
+        erratic balls (e.g. hard kicks on a wide-angle camera).  Default
+        ``30.0`` suits typical broadcast football footage.
+    ball_gate_chi2:
+        Mahalanobis-distance² gate threshold for ball detection gating.
+        Measurements beyond this value (chi-squared 2 DOF) are rejected as
+        likely false YOLO positives.  Default ``9.21`` (99 % quantile).
     """
 
     def __init__(
@@ -167,6 +189,8 @@ class SegmentationTracker:
         tracker: str = "botsort",
         max_age: int = 30,
         use_homography: bool = True,
+        ball_sigma_acc: float = 30.0,
+        ball_gate_chi2: float = 9.21,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -181,7 +205,10 @@ class SegmentationTracker:
         self._detector = None                # lazy-loaded YOLO model
         self._sam = None                     # lazy-loaded SAM2VideoPredictor
         self._next_player_id: int = 1
-        self._ball_kalman = BallKalmanFilter()
+        self._ball_kalman = BallKalmanFilter(
+            sigma_acc=ball_sigma_acc,
+            gate_chi2=ball_gate_chi2,
+        )
 
         # Path to customised tracker YAML written at init time
         self._tracker_config_path: str | None = None

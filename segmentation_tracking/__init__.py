@@ -8,14 +8,14 @@ Modules:
     segmentation_model  -- BoT-SORT + SAM2 tracker for players and ball
     association         -- Hungarian pose-to-mask matching
     visualization       -- Frame annotation with masks, IDs, and skeletons
-    ball_kalman         -- Kalman filter for ball centre tracking
+    ball_kalman         -- Adaptive CA Kalman filter for ball centre tracking (replaces CV filter)
     team_classifier     -- HSV K-means jersey-colour team classifier
 """
 
 from segmentation_tracking.segmentation_model import SegmentationTracker, SegmentationResult
 from segmentation_tracking.association import PlayerTrack, BallTrack, associate_poses_with_tracks
 from segmentation_tracking.visualization import Visualizer
-from segmentation_tracking.ball_kalman import BallKalmanFilter
+from segmentation_tracking.ball_kalman import BallKalmanFilter, AdaptiveBallKalmanFilter
 from segmentation_tracking.team_classifier import TeamClassifier
 
 __all__ = [
@@ -26,5 +26,6 @@ __all__ = [
     "associate_poses_with_tracks",
     "Visualizer",
     "BallKalmanFilter",
+    "AdaptiveBallKalmanFilter",
     "TeamClassifier",
 ]

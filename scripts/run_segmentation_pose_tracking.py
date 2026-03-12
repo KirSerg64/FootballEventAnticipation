@@ -33,6 +33,8 @@ Optional flags::
     --team_colors                         Enable jersey-colour team classification
     --n_teams            2                Number of team clusters (2 or 3)
     --team_refit_interval 30             Refit team clusters every N frames (default 30)
+    --ball_sigma_acc     30.0             Ball Kalman acceleration noise std (px/frame²)
+    --ball_gate_chi2     9.21             Ball Kalman measurement gate threshold (chi² 2DOF)
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -159,6 +161,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: 30)"
         ),
     )
+    # Ball tracking: Adaptive CA Kalman filter parameters
+    parser.add_argument(
+        "--ball_sigma_acc", type=float, default=30.0,
+        help=(
+            "Ball Kalman filter: acceleration noise std (px/frame²). "
+            "Increase for faster/more erratic balls (default: 30.0). "
+            "Controls Q_vel ≈ sigma_acc²; higher values = faster response to kicks."
+        ),
+    )
+    parser.add_argument(
+        "--ball_gate_chi2", type=float, default=9.21,
+        help=(
+            "Ball Kalman filter: Mahalanobis distance² gate threshold (chi² 2DOF). "
+            "Detections beyond this are rejected as false positives (default: 9.21 = 99%)."
+        ),
+    )
     parser.add_argument(
         "--codec", default="mp4v",
         help=(
@@ -222,6 +240,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         tracker=args.tracker,
         max_age=args.max_age,
         use_homography=not args.no_homography,
+        ball_sigma_acc=args.ball_sigma_acc,
+        ball_gate_chi2=args.ball_gate_chi2,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))
