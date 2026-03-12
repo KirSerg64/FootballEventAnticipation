@@ -4,24 +4,28 @@ association.py
 Matches YOLO pose estimation keypoints to segmentation-tracked players.
 
 The association is performed by computing the Intersection-over-Union (IoU)
-between each pose bounding box and the per-player segmentation mask.  When two
-detections have the same best IoU, the one with higher overlap wins.  If no
-pose detection overlaps with a given tracked player (e.g. because the player is
-partially occluded), the track is still returned but without keypoints.
+between each pose bounding box and the per-player segmentation mask bbox.
+Instead of the earlier greedy matching, a globally-optimal assignment is
+computed via the Hungarian algorithm (``scipy.optimize.linear_sum_assignment``).
+A centre-distance fallback runs a second Hungarian pass for tracks that
+received no IoU match above the threshold.
+
+If no pose detection overlaps with a given tracked player the track is still
+returned, but with ``keypoints = None``.
 
 Data structures
 ~~~~~~~~~~~~~~~
 ``PlayerTrack``
     Combined result for a single player in a single frame: segmentation mask,
-    bounding box, player ID, and (optionally) pose keypoints / confidence
-    scores.
+    bounding box, player ID, optional pose keypoints / confidence scores, and
+    an optional team label (set externally by :class:`TeamClassifier`).
 
 ``BallTrack``
     Ball position and mask for a single frame.
 
 Public API
 ~~~~~~~~~~
-``associate_poses_with_tracks(seg_result, pose_results, frame_shape)``
+``associate_poses_with_tracks(seg_result, pose_result, frame_shape, ...)``
     Main entry point.  Returns a list of :class:`PlayerTrack` and a
     :class:`BallTrack` (or *None* if no ball detected).
 """
@@ -33,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +56,8 @@ COCO_KEYPOINT_NAMES = [
 
 # COCO skeleton connectivity (pairs of keypoint indices, 0-based)
 COCO_SKELETON = [
-    (0, 1), (0, 2),          # nose → eyes
-    (1, 3), (2, 4),          # eyes → ears
+    (0, 1), (0, 2),          # nose -> eyes
+    (1, 3), (2, 4),          # eyes -> ears
     (5, 6),                  # shoulders
     (5, 7), (7, 9),          # left arm
     (6, 8), (8, 10),         # right arm
@@ -62,14 +67,10 @@ COCO_SKELETON = [
     (12, 14), (14, 16),      # right leg
 ]
 
-# Small value subtracted from iou_threshold to initialise the best-match
-# comparison so that a match at exactly the threshold is accepted.
-_IOU_THRESHOLD_EPS = 1e-9
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Data structures
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PlayerTrack:
@@ -89,6 +90,9 @@ class PlayerTrack:
     keypoint_scores:
         Array of shape ``(17,)`` with confidence scores for each keypoint,
         or *None* if no pose was associated.
+    team_label:
+        Team index (0, 1, …) assigned by :class:`~segmentation_tracking.\
+team_classifier.TeamClassifier`, or *None* if not yet classified.
     """
 
     id: int
@@ -96,6 +100,7 @@ class PlayerTrack:
     bbox: np.ndarray
     keypoints: np.ndarray | None = None
     keypoint_scores: np.ndarray | None = None
+    team_label: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dictionary."""
@@ -109,6 +114,7 @@ class PlayerTrack:
                 if self.keypoint_scores is not None
                 else None
             ),
+            "team_label": self.team_label,
         }
 
 
@@ -121,7 +127,8 @@ class BallTrack:
     center:
         ``(cx, cy)`` pixel coordinates of the ball centre.
     bbox:
-        Bounding box ``[x1, y1, x2, y2]``, or *None*.
+        Bounding box ``[x1, y1, x2, y2]``, or *None* when the position is
+        a Kalman-filter prediction without a corresponding raw detection.
     mask:
         Binary mask for the ball, shape ``(H, W)``, or *None*.
     """
@@ -138,9 +145,9 @@ class BallTrack:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # IoU helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
     """Intersection-over-Union for two ``[x1, y1, x2, y2]`` boxes."""
@@ -161,14 +168,9 @@ def _center_distance(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
     return float(np.linalg.norm(ca - cb))
 
 
-def _pose_bbox(pose_result_box: np.ndarray) -> np.ndarray:
-    """Extract ``[x1, y1, x2, y2]`` from a single YOLO pose box tensor."""
-    return pose_result_box.astype(np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Public API
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def associate_poses_with_tracks(
     seg_result: Any,
@@ -179,6 +181,11 @@ def associate_poses_with_tracks(
 ) -> tuple[list[PlayerTrack], BallTrack | None]:
     """
     Associate pose estimations with segmentation-tracked players.
+
+    Uses the Hungarian algorithm (globally-optimal 1-to-1 assignment) on the
+    IoU cost matrix between pose bboxes and track bboxes.  A second Hungarian
+    pass using centre distance handles tracks that received no IoU match when
+    *max_center_dist* is provided.
 
     Parameters
     ----------
@@ -194,10 +201,9 @@ def associate_poses_with_tracks(
         normalisation when ``max_center_dist`` is provided).
     iou_threshold:
         Minimum IoU required to associate a pose detection with a track.
-        Lowering this helps when pose bboxes are slightly offset from masks.
     max_center_dist:
         Optional fallback maximum centre distance (pixels) used when no pose
-        detection exceeds *iou_threshold*.
+        detection exceeds *iou_threshold* for a given track.
 
     Returns
     -------
@@ -210,7 +216,7 @@ def associate_poses_with_tracks(
     player_tracks: list[PlayerTrack] = []
     ball_track: BallTrack | None = None
 
-    # ── Build ball track ──────────────────────────────────────────────────────
+    # -- Build ball track -----------------------------------------------------
     if seg_result.ball_center is not None:
         ball_track = BallTrack(
             center=seg_result.ball_center,
@@ -218,7 +224,7 @@ def associate_poses_with_tracks(
             mask=seg_result.ball_mask,
         )
 
-    # ── Extract pose detections ───────────────────────────────────────────────
+    # -- Extract pose detections ----------------------------------------------
     pose_bboxes: list[np.ndarray] = []
     pose_keypoints: list[np.ndarray] = []
     pose_scores: list[np.ndarray] = []
@@ -231,7 +237,6 @@ def associate_poses_with_tracks(
             if boxes is not None and i < len(boxes):
                 bbox_i = boxes.xyxy[i].cpu().numpy().astype(np.float32)
             else:
-                # Derive bbox from keypoints
                 xy = kps.xy[i].cpu().numpy()
                 valid = xy[(xy[:, 0] > 0) | (xy[:, 1] > 0)]
                 if len(valid) == 0:
@@ -242,9 +247,9 @@ def associate_poses_with_tracks(
                     dtype=np.float32,
                 )
 
-            kp_xy = kps.xy[i].cpu().numpy()          # (17, 2)
+            kp_xy = kps.xy[i].cpu().numpy()      # (17, 2)
             kp_conf = (
-                kps.conf[i].cpu().numpy()             # (17,)
+                kps.conf[i].cpu().numpy()         # (17,)
                 if kps.conf is not None
                 else np.ones(len(kp_xy), dtype=np.float32)
             )
@@ -253,52 +258,65 @@ def associate_poses_with_tracks(
             pose_keypoints.append(kp_xy)
             pose_scores.append(kp_conf)
 
-    # ── Match pose → track via IoU ────────────────────────────────────────────
+    # -- Hungarian IoU matching -----------------------------------------------
+    n_tracks = len(seg_result.player_ids)
     n_poses = len(pose_bboxes)
-    pose_used = [False] * n_poses
 
-    for pid, mask, seg_bbox in zip(
-        seg_result.player_ids,
-        seg_result.player_masks,
-        seg_result.player_bboxes,
+    # kp_map[track_idx] = pose_idx  (populated by matching passes)
+    kp_map: dict[int, int] = {}
+    matched_poses: set[int] = set()
+
+    if n_tracks > 0 and n_poses > 0:
+        # Build IoU cost matrix
+        cost = np.ones((n_tracks, n_poses), dtype=np.float64)
+        for ti, seg_bbox in enumerate(seg_result.player_bboxes):
+            for pi, pose_bbox in enumerate(pose_bboxes):
+                cost[ti, pi] = 1.0 - _bbox_iou(seg_bbox, pose_bbox)
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        for ti, pi in zip(row_ind, col_ind):
+            if (1.0 - cost[ti, pi]) >= iou_threshold:
+                kp_map[ti] = pi
+                matched_poses.add(pi)
+
+        # Fallback: centre-distance pass for unmatched tracks
+        if max_center_dist is not None:
+            unmatched_tracks = [ti for ti in range(n_tracks) if ti not in kp_map]
+            unused_poses = [pi for pi in range(n_poses) if pi not in matched_poses]
+
+            if unmatched_tracks and unused_poses:
+                _large = max_center_dist + 1.0
+                dist_cost = np.full(
+                    (len(unmatched_tracks), len(unused_poses)), _large, dtype=np.float64
+                )
+                for i, ti in enumerate(unmatched_tracks):
+                    for j, pi in enumerate(unused_poses):
+                        d = _center_distance(
+                            seg_result.player_bboxes[ti], pose_bboxes[pi]
+                        )
+                        if d < max_center_dist:
+                            dist_cost[i, j] = d
+
+                row_ind2, col_ind2 = linear_sum_assignment(dist_cost)
+                for r, c in zip(row_ind2, col_ind2):
+                    if dist_cost[r, c] < max_center_dist:
+                        ti = unmatched_tracks[r]
+                        pi = unused_poses[c]
+                        kp_map[ti] = pi
+                        matched_poses.add(pi)
+
+    # -- Build PlayerTrack objects --------------------------------------------
+    for ti, (pid, mask, seg_bbox) in enumerate(
+        zip(seg_result.player_ids, seg_result.player_masks, seg_result.player_bboxes)
     ):
-        best_iou = iou_threshold - _IOU_THRESHOLD_EPS  # start below threshold
-        best_pose_idx = -1
-
-        for pi in range(n_poses):
-            if pose_used[pi]:
-                continue
-            iou = _bbox_iou(seg_bbox, pose_bboxes[pi])
-            if iou > best_iou:
-                best_iou = iou
-                best_pose_idx = pi
-
-        # Fallback: centre-distance matching
-        if best_pose_idx == -1 and max_center_dist is not None:
-            min_dist = max_center_dist
-            for pi in range(n_poses):
-                if pose_used[pi]:
-                    continue
-                d = _center_distance(seg_bbox, pose_bboxes[pi])
-                if d < min_dist:
-                    min_dist = d
-                    best_pose_idx = pi
-
-        kp_arr: np.ndarray | None = None
-        kp_scores: np.ndarray | None = None
-
-        if best_pose_idx >= 0:
-            kp_arr = pose_keypoints[best_pose_idx]
-            kp_scores = pose_scores[best_pose_idx]
-            pose_used[best_pose_idx] = True
-
+        pi = kp_map.get(ti)
         player_tracks.append(
             PlayerTrack(
                 id=pid,
                 mask=mask,
                 bbox=seg_bbox,
-                keypoints=kp_arr,
-                keypoint_scores=kp_scores,
+                keypoints=pose_keypoints[pi] if pi is not None else None,
+                keypoint_scores=pose_scores[pi] if pi is not None else None,
             )
         )
 

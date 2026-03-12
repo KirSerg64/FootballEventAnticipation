@@ -136,7 +136,7 @@ class Visualizer:
             if self.show_bbox:
                 self._draw_bbox(canvas, track.bbox, color)
             if self.show_id:
-                self._draw_label(canvas, track.id, track.bbox, color)
+                self._draw_label(canvas, track.id, track.bbox, color, track.team_label)
             if self.show_skeleton and track.keypoints is not None:
                 self._draw_skeleton(canvas, track.keypoints, track.keypoint_scores, color)
 
@@ -191,8 +191,10 @@ class Visualizer:
         player_id: int,
         bbox: np.ndarray,
         color: tuple[int, int, int],
+        team_label: int | None = None,
     ) -> None:
-        label = f"Player {player_id}"
+        team_suffix = f" T{team_label}" if team_label is not None else ""
+        label = f"P{player_id}{team_suffix}"
         x1, y1 = int(bbox[0]), int(bbox[1])
 
         (tw, th), baseline = cv2.getTextSize(

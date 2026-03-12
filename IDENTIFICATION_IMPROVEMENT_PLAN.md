@@ -1,10 +1,14 @@
 # Identification Quality Improvement Plan
 
-> **Status: AWAITING APPROVAL – no code has been changed yet.**
+> **Status: IMPROVEMENTS 1 + 2 + 3 + 4 + 6 + 7 IMPLEMENTED.**
 >
-> This document analyses the root causes of poor player-ID results in the current
-> pipeline and proposes a prioritised set of concrete improvements.
-> Implementations will begin only after this plan is reviewed and approved.
+> Improvements 5 (Appearance Re-ID / OSNet) and 8 (custom standalone Kalman
+> tracker) were not approved and remain unimplemented.
+>
+> See `segmentation_tracking/ball_kalman.py`, `segmentation_tracking/team_classifier.py`,
+> and the updated `segmentation_tracking/segmentation_model.py`,
+> `segmentation_tracking/association.py`, `segmentation_tracking/visualization.py`,
+> and `scripts/run_segmentation_pose_tracking.py` for the changes.
 
 ---
 
@@ -336,39 +340,33 @@ broadcast footage.  Suitable starting points:
 
 ## 3. Recommended Implementation Order
 
-| Priority | Improvement | Files affected | Approx. effort |
-|----------|------------|----------------|----------------|
-| 1 | **E** – BoT-SORT / ByteTrack as primary tracker | `segmentation_model.py` | 1–2 days |
-| 2 | **A** – Hungarian matching (complement BoT-SORT fallback) | `association.py`, `segmentation_model.py` | 0.5 days |
-| 3 | **G** – Track lifecycle management | `segmentation_model.py` | 0.5 days |
-| 4 | **D** – Camera-motion compensation | `segmentation_model.py` | 1 day |
-| 5 | **B** – Appearance Re-ID (OSNet) | new `reid_model.py` | 1–2 days |
-| 6 | **H** – Ball Kalman filter | `segmentation_model.py` | 0.5 days |
-| 7 | **F** – Team color clustering | new `team_classifier.py` | 0.5 days |
-| 8 | **C** – Custom Kalman filter (if not using BoT-SORT) | new `kalman_tracker.py` | 1 day |
-| 9 | **I** – Domain-specific YOLO | model weights only | 1–3 days (data prep) |
-
-**Recommended starting point:** Implement **E + A + G** first.  These three
-together address the most significant failure modes (greedy matching, no motion
-model, no track lifecycle) and rely only on libraries already available in
-`ultralytics` and `scipy`.  They can be done in ~2 days and should produce a
-visible improvement on any test video.
+| Priority | Improvement | Files affected | Status |
+|----------|------------|----------------|--------|
+| 1 | **E** – BoT-SORT / ByteTrack as primary tracker | `segmentation_model.py` | ✅ Implemented |
+| 2 | **A** – Hungarian matching | `association.py`, `segmentation_model.py` | ✅ Implemented |
+| 3 | **G** – Track lifecycle management | `segmentation_model.py` | ✅ Implemented |
+| 4 | **D** – Camera-motion compensation | `segmentation_model.py` | ✅ Implemented |
+| 5 | **B** – Appearance Re-ID (OSNet) | new `reid_model.py` | ⏸ Not approved |
+| 6 | **H** – Ball Kalman filter | `ball_kalman.py`, `segmentation_model.py` | ✅ Implemented |
+| 7 | **F** – Team color clustering | `team_classifier.py` | ✅ Implemented |
+| 8 | **C** – Custom Kalman filter (if not using BoT-SORT) | new `kalman_tracker.py` | ⏸ Not approved |
+| 9 | **I** – Domain-specific YOLO | model weights only | ⏸ Not approved |
 
 ---
 
-## 4. New CLI Parameters (after approval)
+## 4. New CLI Parameters (implemented)
 
-The following parameters would be added to
+The following parameters were added to
 `scripts/run_segmentation_pose_tracking.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--tracker` | `botsort` | Tracking algorithm: `botsort`, `bytetrack` |
-| `--reid_model` | `osnet_x0_25` | Re-ID backbone; `none` disables Re-ID |
-| `--min_hits` | `3` | Minimum consecutive detections before confirming a track |
+| `--tracker` | `botsort` | Tracking algorithm: `botsort` or `bytetrack` |
 | `--max_age` | `30` | Frames a track survives without a detection |
-| `--homography` | off | Enable camera-motion compensation |
+| `--no_homography` | off | Disable camera-motion compensation |
 | `--team_colors` | off | Enable team-color clustering |
+| `--n_teams` | `2` | Number of K-means team clusters |
+| `--team_refit_interval` | `30` | Re-run K-means every N frames |
 
 ---
 
