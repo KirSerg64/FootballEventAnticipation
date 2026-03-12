@@ -10,6 +10,7 @@ Modules:
     visualization       -- Frame annotation with masks, IDs, and skeletons
     ball_kalman         -- Detection-first + MOSSE DCF ball tracker (BallDCFTracker); FRoG-MOT motion-state; UKF retained for compat
     team_classifier     -- HSV K-means jersey-colour team classifier
+    vector_field        -- Player velocity tracking and vector-field attractor estimation
 """
 
 from segmentation_tracking.segmentation_model import SegmentationTracker, SegmentationResult
@@ -17,6 +18,7 @@ from segmentation_tracking.association import PlayerTrack, BallTrack, associate_
 from segmentation_tracking.visualization import Visualizer
 from segmentation_tracking.ball_kalman import BallKalmanFilter, AdaptiveBallKalmanFilter, BallDCFTracker, BallMotionState
 from segmentation_tracking.team_classifier import TeamClassifier
+from segmentation_tracking.vector_field import PlayerVelocityTracker, AttractorEstimate, estimate_attractor
 
 __all__ = [
     "SegmentationTracker",
@@ -30,4 +32,7 @@ __all__ = [
     "BallDCFTracker",
     "BallMotionState",
     "TeamClassifier",
+    "PlayerVelocityTracker",
+    "AttractorEstimate",
+    "estimate_attractor",
 ]

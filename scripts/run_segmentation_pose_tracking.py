@@ -26,6 +26,8 @@ Optional flags::
     --no_skeleton                         Disable skeleton rendering
     --no_ball                             Disable ball overlay
     --ball_debug                          Colour-code ball by detection source + show stats HUD
+    --show_attractor                      Draw velocity vectors + vector-field attractor estimate
+    --attractor_history  5                Frames of position history for velocity averaging
     --export_json                         Export player_tracks.json + ball_track.json
     --redetect_interval  30               Re-run YOLO every N frames for new players
     --tracker            botsort          Primary tracker: botsort or bytetrack
@@ -61,6 +63,8 @@ from segmentation_tracking import (
     Visualizer,
     associate_poses_with_tracks,
     TeamClassifier,
+    PlayerVelocityTracker,
+    estimate_attractor,
 )
 
 logging.basicConfig(
@@ -131,6 +135,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Enable ball detection debug visualisation: colour-code ball by source "
             "(green=DETECT, yellow-green=ROI, orange=MOSSE, red=PRED) and show a "
             "cumulative detection-rate HUD in the top-right corner."
+        ),
+    )
+    parser.add_argument(
+        "--show_attractor", action="store_true",
+        help=(
+            "Draw per-player velocity arrows and the vector-field attractor — the point "
+            "that all player velocity rays collectively converge towards, which estimates "
+            "the ball position.  Displayed as a colour-coded diamond marker."
+        ),
+    )
+    parser.add_argument(
+        "--attractor_history", type=int, default=5,
+        help=(
+            "Number of frames of position history used to compute per-player velocity "
+            "when --show_attractor is enabled (default: 5)."
         ),
     )
     parser.add_argument(
@@ -303,6 +322,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         show_skeleton=not args.no_skeleton,
         show_ball=not args.no_ball,
         show_ball_debug=args.ball_debug,
+        show_attractor=args.show_attractor,
+    )
+
+    # Vector-field attractor tracker (only allocated when needed)
+    vel_tracker: PlayerVelocityTracker | None = (
+        PlayerVelocityTracker(history_len=args.attractor_history)
+        if args.show_attractor
+        else None
     )
 
     # JSON export accumulators
@@ -357,8 +384,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
             for pt in player_tracks:
                 pt.team_label = team_classifier.get_team(pt.id)
 
+        # -- Vector-field attractor (optional) --------------------------------
+        velocities = None
+        attractor = None
+        if vel_tracker is not None:
+            velocities = vel_tracker.update(player_tracks)
+            attractor = estimate_attractor(
+                velocities,
+                frame_shape=(frame_h, frame_w),
+            )
+
         # -- Visualization ----------------------------------------------------
-        annotated = visualizer.draw_frame(frame, player_tracks, ball_track, frame_idx=frame_idx)
+        annotated = visualizer.draw_frame(
+            frame, player_tracks, ball_track,
+            frame_idx=frame_idx,
+            velocities=velocities,
+            attractor=attractor,
+        )
         writer.write(annotated)
 
         # -- JSON export ------------------------------------------------------

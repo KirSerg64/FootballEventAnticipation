@@ -2,7 +2,7 @@
 visualization.py
 ----------------
 Frame annotation: semi-transparent segmentation masks, player IDs, pose
-skeletons, and ball overlay.
+skeletons, ball overlay, and velocity vector-field attractor.
 
 Public API
 ~~~~~~~~~~
@@ -25,6 +25,7 @@ from segmentation_tracking.association import (
     COCO_SKELETON,
     PlayerTrack,
 )
+from segmentation_tracking.vector_field import AttractorEstimate
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,12 @@ _BALL_SOURCE_LABELS: dict[str, str] = {
 
 # Golden ratio conjugate – spreads player IDs to perceptually distinct hues
 _GOLDEN_RATIO = 0.6180339887
+
+# Attractor visualisation constants
+_ATTRACTOR_COLOR    = (0, 255, 255)    # cyan diamond (same as default ball, but distinct marker)
+_ATTRACTOR_HI_COLOR = (0, 255, 200)    # high-confidence → bright cyan-green
+_ATTRACTOR_LO_COLOR = (0, 130, 255)    # low-confidence  → orange-yellow
+_VECTOR_ALPHA       = 0.70             # opacity of velocity arrows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +111,18 @@ class Visualizer:
         * Red     → velocity extrapolation only.
 
         Defaults to *False*.
+    show_attractor:
+        When *True*, draw per-player velocity arrows and the vector-field
+        **attractor** — the point that the player velocity rays collectively
+        converge towards, which estimates the ball position.  The attractor
+        is shown as a rotating diamond marker with a confidence-coloured
+        ring:
+
+        * Bright cyan-green → high confidence (many fast players pointing to it).
+        * Orange-yellow     → low confidence (few players or ambiguous directions).
+
+        Requires caller to pass ``velocities`` and ``attractor`` to
+        :meth:`draw_frame`.  Defaults to *False*.
     keypoint_conf_threshold:
         Only draw keypoints whose confidence exceeds this value.
     """
@@ -116,6 +135,7 @@ class Visualizer:
         show_skeleton: bool = True,
         show_ball: bool = True,
         show_ball_debug: bool = False,
+        show_attractor: bool = False,
         keypoint_conf_threshold: float = _KP_CONF_THRESHOLD,
     ) -> None:
         self.mask_alpha = mask_alpha
@@ -124,6 +144,7 @@ class Visualizer:
         self.show_skeleton = show_skeleton
         self.show_ball = show_ball
         self.show_ball_debug = show_ball_debug
+        self.show_attractor = show_attractor
         self.keypoint_conf_threshold = keypoint_conf_threshold
 
         # Running detection-source counters (reset on demand via reset_ball_stats)
@@ -149,6 +170,8 @@ class Visualizer:
         player_tracks: Sequence[PlayerTrack],
         ball_track: BallTrack | None = None,
         frame_idx: int | None = None,
+        velocities: dict[int, tuple[float, float, float, float]] | None = None,
+        attractor: AttractorEstimate | None = None,
     ) -> np.ndarray:
         """
         Annotate a single frame and return the result.
@@ -167,6 +190,14 @@ class Visualizer:
         frame_idx:
             Optional 0-based frame index; shown in the debug HUD when
             ``show_ball_debug`` is enabled.
+        velocities:
+            Optional mapping ``{player_id: (cx, cy, vx, vy)}`` from
+            :class:`~segmentation_tracking.vector_field.PlayerVelocityTracker`.
+            Used when ``show_attractor`` is *True* to draw velocity arrows.
+        attractor:
+            Optional :class:`~segmentation_tracking.vector_field.AttractorEstimate`
+            from :func:`~segmentation_tracking.vector_field.estimate_attractor`.
+            Drawn when ``show_attractor`` is *True*.
 
         Returns
         -------
@@ -179,6 +210,10 @@ class Visualizer:
         for track in player_tracks:
             color = _id_to_color(track.id)
             canvas = self._draw_mask(canvas, track.mask, color)
+
+        # Draw velocity arrows behind bounding boxes (so boxes are on top)
+        if self.show_attractor and velocities:
+            self._draw_velocity_vectors(canvas, velocities)
 
         # Draw player bounding boxes, IDs, and skeletons on top of masks
         for track in player_tracks:
@@ -193,6 +228,10 @@ class Visualizer:
         # Draw ball
         if self.show_ball and ball_track is not None:
             canvas = self._draw_ball(canvas, ball_track)
+
+        # Draw vector-field attractor
+        if self.show_attractor and attractor is not None:
+            self._draw_attractor(canvas, attractor)
 
         # Update running counters and draw debug HUD
         self._total_frames += 1
@@ -464,3 +503,136 @@ class Visualizer:
             cv2.putText(canvas, txt, (x0 + pad, ty), font, fscale, color, fthick, cv2.LINE_AA)
 
         return canvas
+
+    # ── Vector-field attractor helpers ────────────────────────────────────────
+
+    def _draw_velocity_vectors(
+        self,
+        canvas: np.ndarray,
+        velocities: dict[int, tuple[float, float, float, float]],
+        scale: float = 8.0,
+    ) -> None:
+        """Draw semi-transparent velocity arrows from each player's centre.
+
+        Each arrow is colour-coded by the player's ID (same palette as the
+        bounding boxes) and scaled proportionally to their speed.  Arrows are
+        drawn on a separate layer and blended at *_VECTOR_ALPHA* opacity so
+        they don't obscure other annotations.
+
+        Parameters
+        ----------
+        canvas:
+            BGR frame to annotate in-place.
+        velocities:
+            ``{player_id: (cx, cy, vx, vy)}`` from
+            :class:`~segmentation_tracking.vector_field.PlayerVelocityTracker`.
+        scale:
+            Multiplier that converts velocity in px/frame to displayed arrow
+            length in pixels.  Defaults to 8 (so a 10 px/frame speed gives
+            an 80-pixel arrow).
+        """
+        if not velocities:
+            return
+
+        overlay = canvas.copy()
+
+        for pid, (cx, cy, vx, vy) in velocities.items():
+            speed = float(np.hypot(vx, vy))
+            if speed < 0.1:
+                continue
+
+            color = _id_to_color(pid)
+            ox, oy = int(cx), int(cy)
+            tx = int(cx + vx * scale)
+            ty = int(cy + vy * scale)
+
+            # Arrow shaft
+            cv2.arrowedLine(
+                overlay, (ox, oy), (tx, ty),
+                color, 2, cv2.LINE_AA, tipLength=0.35,
+            )
+            # Speed label at tip
+            spd_txt = f"{speed:.1f}"
+            cv2.putText(
+                overlay, spd_txt, (tx + 3, ty - 3),
+                _LABEL_FONT, 0.38, color, 1, cv2.LINE_AA,
+            )
+
+        # Blend arrows onto canvas
+        blended = cv2.addWeighted(overlay, _VECTOR_ALPHA, canvas, 1.0 - _VECTOR_ALPHA, 0)
+        canvas[:] = blended
+
+    def _draw_attractor(
+        self,
+        canvas: np.ndarray,
+        attractor: AttractorEstimate,
+    ) -> None:
+        """Draw the vector-field attractor as a diamond marker with a label.
+
+        The marker colour interpolates between :data:`_ATTRACTOR_LO_COLOR`
+        (low confidence) and :data:`_ATTRACTOR_HI_COLOR` (high confidence)
+        based on ``attractor.confidence``.
+
+        A semi-transparent filled diamond is drawn, then outlined in black,
+        then labeled with "Attractor (conf=X.XX)" with player count and mean
+        speed on the next line.
+
+        Parameters
+        ----------
+        canvas:
+            BGR frame to annotate in-place.
+        attractor:
+            :class:`~segmentation_tracking.vector_field.AttractorEstimate`.
+        """
+        ax, ay = int(attractor.point[0]), int(attractor.point[1])
+        conf = float(attractor.confidence)
+
+        # Interpolate colour between lo (orange) and hi (cyan-green)
+        lo = np.array(_ATTRACTOR_LO_COLOR, dtype=np.float32)
+        hi = np.array(_ATTRACTOR_HI_COLOR, dtype=np.float32)
+        color_f = lo + conf * (hi - lo)
+        color = (int(color_f[0]), int(color_f[1]), int(color_f[2]))
+
+        # Diamond half-size (grows slightly with confidence)
+        r = max(8, int(10 + conf * 8))
+
+        # Diamond vertices: top, right, bottom, left
+        pts = np.array([
+            [ax,     ay - r],
+            [ax + r, ay    ],
+            [ax,     ay + r],
+            [ax - r, ay    ],
+        ], dtype=np.int32)
+
+        # Semi-transparent fill on an overlay
+        overlay = canvas.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        blended = cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0)
+        canvas[:] = blended
+
+        # Solid outline
+        cv2.polylines(canvas, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+        cv2.polylines(canvas, [pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+
+        # Centre dot
+        cv2.circle(canvas, (ax, ay), 3, (255, 255, 255), -1, cv2.LINE_AA)
+
+        # Label
+        label1 = f"Attractor (conf={conf:.2f})"
+        label2 = f"n={attractor.n_players}  spd={attractor.mean_speed:.1f}px/f"
+        lx = ax + r + 6
+        ly = ay - 4
+        for label in (label1, label2):
+            (tw, th), bl = cv2.getTextSize(label, _LABEL_FONT, 0.50, 1)
+            cv2.rectangle(
+                canvas,
+                (lx - 2, ly - th - 2),
+                (lx + tw + 2, ly + bl + 2),
+                (20, 20, 20),
+                cv2.FILLED,
+            )
+            cv2.putText(
+                canvas, label, (lx, ly),
+                _LABEL_FONT, 0.50, color, 1, cv2.LINE_AA,
+            )
+            ly += th + bl + 6
