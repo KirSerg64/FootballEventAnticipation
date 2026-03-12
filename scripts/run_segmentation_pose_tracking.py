@@ -28,6 +28,9 @@ Optional flags::
     --ball_debug                          Colour-code ball by detection source + show stats HUD
     --show_attractor                      Draw velocity vectors + vector-field attractor estimate
     --attractor_history  5                Frames of position history for velocity averaging
+    --attractor_mode     velocity         Direction mode: 'velocity' or 'acceleration'
+    --attractor_smooth   8.0              Kalman process-noise std (px/frame²); higher = smoother
+    --attractor_max_stale 30              Stale frames before attractor marker disappears
     --export_json                         Export player_tracks.json + ball_track.json
     --redetect_interval  30               Re-run YOLO every N frames for new players
     --tracker            botsort          Primary tracker: botsort or bytetrack
@@ -65,6 +68,7 @@ from segmentation_tracking import (
     TeamClassifier,
     PlayerVelocityTracker,
     estimate_attractor,
+    AttractorSmoother,
 )
 
 logging.basicConfig(
@@ -150,6 +154,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Number of frames of position history used to compute per-player velocity "
             "when --show_attractor is enabled (default: 5)."
+        ),
+    )
+    parser.add_argument(
+        "--attractor_mode", default="velocity",
+        choices=["velocity", "acceleration"],
+        help=(
+            "Direction mode for the vector-field attractor when --show_attractor is "
+            "enabled.  'velocity' (default) uses player velocity vectors; "
+            "'acceleration' uses the change in velocity — more reactive to sudden "
+            "direction changes but requires ≥3 frames of history."
+        ),
+    )
+    parser.add_argument(
+        "--attractor_smooth", type=float, default=8.0,
+        help=(
+            "Kalman filter process-noise standard deviation (px/frame²) for the "
+            "attractor smoother (default: 8.0).  Larger values allow the smoothed "
+            "position to follow rapid changes more closely at the cost of less "
+            "smoothing.  Set to 0 to disable smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--attractor_max_stale", type=int, default=30,
+        help=(
+            "Maximum number of consecutive frames with no valid raw attractor "
+            "estimate before the attractor marker disappears (default: 30).  "
+            "During the hold period the marker is shown with a dashed outline "
+            "and linearly decaying confidence."
         ),
     )
     parser.add_argument(
@@ -331,6 +363,15 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if args.show_attractor
         else None
     )
+    # Kalman smoother for the attractor position
+    attractor_smoother: AttractorSmoother | None = (
+        AttractorSmoother(
+            process_noise_std=args.attractor_smooth,
+            max_stale_frames=args.attractor_max_stale,
+        )
+        if args.show_attractor and args.attractor_smooth > 0
+        else None
+    )
 
     # JSON export accumulators
     player_tracks_export: list[dict] = []
@@ -389,10 +430,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
         attractor = None
         if vel_tracker is not None:
             velocities = vel_tracker.update(player_tracks)
-            attractor = estimate_attractor(
-                velocities,
+
+            # Choose direction vectors based on selected mode
+            if args.attractor_mode == "acceleration":
+                direction_vectors = vel_tracker.get_accelerations()
+            else:
+                direction_vectors = velocities
+
+            raw_attractor = estimate_attractor(
+                direction_vectors,
                 frame_shape=(frame_h, frame_w),
             )
+
+            # Apply Kalman smoother (or use raw directly if smoothing disabled)
+            if attractor_smoother is not None:
+                attractor = attractor_smoother.update(
+                    raw_attractor, frame_shape=(frame_h, frame_w)
+                )
+            else:
+                attractor = raw_attractor
 
         # -- Visualization ----------------------------------------------------
         annotated = visualizer.draw_frame(

@@ -573,9 +573,10 @@ class Visualizer:
         (low confidence) and :data:`_ATTRACTOR_HI_COLOR` (high confidence)
         based on ``attractor.confidence``.
 
-        A semi-transparent filled diamond is drawn, then outlined in black,
-        then labeled with "Attractor (conf=X.XX)" with player count and mean
-        speed on the next line.
+        When ``attractor.is_held`` is *True* (the Kalman smoother is predicting
+        from a stale estimate), the diamond outline is dashed and the label
+        carries a ``[HELD]`` tag and the stale-frame count.  The marker
+        becomes progressively more transparent as ``stale_frames`` grows.
 
         Parameters
         ----------
@@ -586,6 +587,8 @@ class Visualizer:
         """
         ax, ay = int(attractor.point[0]), int(attractor.point[1])
         conf = float(attractor.confidence)
+        is_held = getattr(attractor, "is_held", False)
+        stale_frames = getattr(attractor, "stale_frames", 0)
 
         # Interpolate colour between lo (orange) and hi (cyan-green)
         lo = np.array(_ATTRACTOR_LO_COLOR, dtype=np.float32)
@@ -593,8 +596,10 @@ class Visualizer:
         color_f = lo + conf * (hi - lo)
         color = (int(color_f[0]), int(color_f[1]), int(color_f[2]))
 
-        # Diamond half-size (grows slightly with confidence)
-        r = max(8, int(10 + conf * 8))
+        # Diamond half-size (grows slightly with confidence, shrinks when held)
+        r = max(6, int(10 + conf * 8))
+        if is_held:
+            r = max(6, int(r * 0.8))
 
         # Diamond vertices: top, right, bottom, left
         pts = np.array([
@@ -604,21 +609,44 @@ class Visualizer:
             [ax - r, ay    ],
         ], dtype=np.int32)
 
+        # Fill opacity: full (0.55) when fresh; fades linearly toward 0.15
+        # when held, using the already-decayed confidence as the fade proxy
+        # so the visual transparency matches the semantic confidence.
+        _FILL_ALPHA_MAX = 0.55
+        _FILL_ALPHA_MIN = 0.15
+        if not is_held:
+            fill_alpha = _FILL_ALPHA_MAX
+        else:
+            # conf is already 0→ base when stale; re-map to [_MIN, _MAX] range
+            fill_alpha = _FILL_ALPHA_MIN + conf * (_FILL_ALPHA_MAX - _FILL_ALPHA_MIN)
+
         # Semi-transparent fill on an overlay
         overlay = canvas.copy()
         cv2.fillPoly(overlay, [pts], color)
-        blended = cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0)
+        blended = cv2.addWeighted(overlay, fill_alpha, canvas, 1.0 - fill_alpha, 0)
         canvas[:] = blended
 
-        # Solid outline
-        cv2.polylines(canvas, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-        cv2.polylines(canvas, [pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+        # Outline — solid for fresh estimate, dashed-style (dotted segments) for held
+        if not is_held:
+            cv2.polylines(canvas, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+            cv2.polylines(canvas, [pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+        else:
+            # Draw "dashed" diamond by segmenting each edge into alternating pieces
+            verts = [pts[0], pts[1], pts[2], pts[3], pts[0]]
+            for vi in range(len(verts) - 1):
+                p0 = verts[vi]
+                p1 = verts[vi + 1]
+                # Draw only first 60% of each edge (creates a dashed look)
+                mid = (int(0.4 * p0[0] + 0.6 * p1[0]), int(0.4 * p0[1] + 0.6 * p1[1]))
+                cv2.line(canvas, tuple(p0), mid, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.line(canvas, tuple(p0), mid, color, 1, cv2.LINE_AA)
 
         # Centre dot
         cv2.circle(canvas, (ax, ay), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
         # Label
-        label1 = f"Attractor (conf={conf:.2f})"
+        held_tag = f" [HELD:{stale_frames}f]" if is_held else ""
+        label1 = f"Attractor (conf={conf:.2f}){held_tag}"
         label2 = f"n={attractor.n_players}  spd={attractor.mean_speed:.1f}px/f"
         lx = ax + r + 6
         ly = ay - 4
