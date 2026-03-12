@@ -33,9 +33,9 @@ Optional flags::
     --team_colors                         Enable jersey-colour team classification
     --n_teams            2                Number of team clusters (2 or 3)
     --team_refit_interval 30             Refit team clusters every N frames (default 30)
-    --ball_sigma_acc     30.0             Ball UKF acceleration noise std (px/frame²)
-    --ball_laplacian_b   2.0              Laplacian M-estimator scale (Mahalanobis units)
-    --ball_gate_chi2     900.0            Ball UKF hard gate (chi² 2DOF, only extreme outliers)
+    --ball_patch_size    32               Ball DCF MOSSE template patch size (px)
+    --ball_search_radius 60               Ball DCF MOSSE search half-radius (px)
+    --ball_psr_threshold 7.0             Ball DCF MOSSE PSR acceptance threshold
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -162,28 +162,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: 30)"
         ),
     )
-    # Ball tracking: UKF + Laplacian robust statistics parameters
+    # Ball tracking: detection-first + MOSSE DCF correlation parameters
     parser.add_argument(
-        "--ball_sigma_acc", type=float, default=30.0,
+        "--ball_patch_size", type=int, default=32,
         help=(
-            "Ball UKF: acceleration noise std (px/frame²). "
-            "Controls Q_vel ≈ sigma_acc²; higher = faster response to kicks (default: 30.0)."
+            "Ball DCF: MOSSE template patch size (px, default: 32). "
+            "Larger captures more context; smaller is faster."
         ),
     )
     parser.add_argument(
-        "--ball_laplacian_b", type=float, default=2.0,
+        "--ball_search_radius", type=int, default=60,
         help=(
-            "Ball UKF: Laplacian M-estimator scale in Mahalanobis units. "
-            "Innovations with d > b are soft-downweighted by b/d. "
-            "Lower values = more robust to outliers but slower kick response (default: 2.0)."
+            "Ball DCF: MOSSE search half-radius (px) when YOLO misses (default: 60). "
+            "Increase for faster balls on wide-angle cameras."
         ),
     )
     parser.add_argument(
-        "--ball_gate_chi2", type=float, default=900.0,
+        "--ball_psr_threshold", type=float, default=7.0,
         help=(
-            "Ball UKF: hard gate threshold (chi² 2DOF, d² units). "
-            "Only extreme outliers beyond this are hard-rejected (default: 900.0 = d=30). "
-            "The Laplacian soft gate handles normal false detections."
+            "Ball DCF: minimum Peak-to-Sidelobe Ratio for MOSSE acceptance (default: 7.0). "
+            "Lower = accept noisier predictions; higher = more conservative."
         ),
     )
     parser.add_argument(
@@ -249,9 +247,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         tracker=args.tracker,
         max_age=args.max_age,
         use_homography=not args.no_homography,
-        ball_sigma_acc=args.ball_sigma_acc,
-        ball_laplacian_b=args.ball_laplacian_b,
-        ball_gate_chi2=args.ball_gate_chi2,
+        ball_patch_size=args.ball_patch_size,
+        ball_search_radius=args.ball_search_radius,
+        ball_psr_threshold=args.ball_psr_threshold,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))

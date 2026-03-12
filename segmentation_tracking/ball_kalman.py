@@ -1,19 +1,57 @@
 """
 ball_kalman.py
 --------------
-Unscented Kalman Filter (UKF) with Laplacian-robust statistics for football
-tracking.
+Ball tracking: UKF with Laplacian-robust statistics (retained for reference /
+backward compatibility) **plus** the primary ``BallDCFTracker`` — a
+detection-first tracker with MOSSE correlation-filter gap filling.
 
-Why the previous Adaptive CA Kalman filter was still insufficient
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The Adaptive CA filter used a **hard Mahalanobis gate** (chi² = 9.21, d ≈ 3.03).
-When a kick causes the ball to jump far from the predicted position, the
-innovation's Mahalanobis distance often exceeds the gate — so the measurement
-is **completely rejected** on the kick frame.  The filter then only predicts
-(carrying the old velocity forward), delaying trajectory recovery by 3–5 frames.
+Why every Kalman / UKF approach fails for instant kicks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Both the adaptive CA filter and the UKF share the same fundamental flaw: they
+use the *predicted state* as an anchor when deciding how much to trust a new
+measurement.  Once the filter converges (after many frames of stable tracking)
+the state covariance **P** is small.  For a hard kick where the ball jumps
+200 px in one frame:
 
-Improvements: UKF + Laplacian robust statistics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* Innovation Mahalanobis distance:  d ≈ 200 / √R ≈ 100  (with R = 4 px²)
+* Laplacian M-estimator weight:      w = min(1, b/d) = min(1, 2/100) = 0.02
+* Net correction this frame:         2 % of 200 px = 4 px  (vs. 200 px needed)
+
+This is a **mathematical limitation of any Kalman-family filter**, not a
+tuning problem.  No choice of b, gate threshold, Q, or sigma-point spread
+can recover instant direction changes once P has converged.
+
+Primary solution: ``BallDCFTracker`` (detection-first + MOSSE DCF)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The root insight from tracking-by-detection research (ByteTrack 2022,
+OC-SORT 2023): **the detector is almost always right when it fires**.
+The Kalman filter was wrong to gate or smooth YOLO ball detections.
+
+``BallDCFTracker`` design:
+
+1. **Detection-first (zero latency on kicks)**
+   When YOLO provides a ball detection at ``(cx, cy)`` the tracker outputs
+   that position *immediately* — no Kalman smoothing, no gating.  A 200 px
+   kick is captured with 100 % accuracy on frame 1.
+
+2. **MOSSE DCF for gap filling** *(Bolme et al., CVPR 2010)*
+   A Minimum Output Sum of Squared Error (MOSSE) discriminative correlation
+   filter maintains an appearance model of the ball in the Fourier domain.
+   When YOLO misses the ball, the filter searches for it in an expanded
+   window around the velocity-extrapolated position.  The Peak-to-Sidelobe
+   Ratio (PSR) measures search confidence; results below the PSR threshold
+   fall back to linear extrapolation.
+
+   Complexity is O(n log n) per frame (FFT-based) — fast enough for real
+   time even on CPU.
+
+3. **Velocity extrapolation** (tertiary fallback)
+   When DCF confidence is low (PSR < threshold) or the gap exceeds
+   ``max_gap_for_dcf``, the last known velocity (median of recent detections)
+   extrapolates the position forward.
+
+``BallKalmanFilter`` / UKF (retained, secondary)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 **Unscented Kalman Filter (UKF) — van der Merwe scaled sigma points**
     The UKF propagates a set of carefully chosen *sigma points* through the
@@ -75,26 +113,30 @@ Improvements: UKF + Laplacian robust statistics
     ``NIS / 2`` rule and is the correct choice for heavy-tailed Laplacian
     process noise.
 
-Public API
-~~~~~~~~~~
-``BallKalmanFilter``  (``AdaptiveBallKalmanFilter`` is a backward-compat alias)
-    ``initialize(cx, cy)``                – seed from the first observation
-    ``predict() → (cx, cy)``             – advance without a measurement
-    ``update(cx, cy) → (cx, cy)``        – advance + Laplacian-robust correct
-    ``position → (cx, cy) | None``       – current filtered centre
-    ``velocity → (vcx, vcy) | None``     – current filtered velocity
-    ``acceleration → (acx, acy) | None`` – current filtered acceleration
-    ``laplacian_weight``                 – M-estimator weight from last update
-    ``initialized``                      – True once seeded
-    ``frames_since_detection``           – frames without an accepted measurement
-    ``last_measurement_gated``           – True if last update was hard-gated
-    ``reset()``                          – return to uninitialised state
+Public API (primary)
+~~~~~~~~~~~~~~~~~~~~
+``BallDCFTracker``  ← **use this**
+    ``initialize(cx, cy[, frame])``       – seed from first observation
+    ``predict([frame]) → (cx, cy)``       – MOSSE search or extrapolation
+    ``update(cx, cy[, frame]) → (cx,cy)`` – accept detection immediately
+    ``position → (cx, cy) | None``        – current position
+    ``velocity → (vcx, vcy) | None``      – velocity from recent detections
+    ``initialized``                        – True once seeded
+    ``frames_since_detection``             – consecutive frames without YOLO
+    ``last_measurement_gated``             – always False (DCF never gates)
+    ``laplacian_weight``                   – always 1.0 (compat with UKF API)
+    ``reset()``                            – return to uninitialised state
+
+``BallKalmanFilter``  (``AdaptiveBallKalmanFilter`` alias, retained for
+backward compatibility — not used by default any more)
 """
 
 from __future__ import annotations
 
 import logging
+from collections import deque
 
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -602,3 +644,506 @@ class BallKalmanFilter:
 
 # Backward-compatibility alias
 AdaptiveBallKalmanFilter = BallKalmanFilter
+
+
+# ---------------------------------------------------------------------------
+# MOSSE Discriminative Correlation Filter
+# ---------------------------------------------------------------------------
+
+class _MOSSEFilter:
+    """Minimum Output Sum of Squared Error (MOSSE) correlation filter.
+
+    Learns a frequency-domain filter that produces a peaked Gaussian response
+    at the target location when convolved with the image patch.  All
+    computation is in the Fourier domain — O(n log n) per frame.
+
+    Reference: Bolme et al., "Visual Object Tracking using Adaptive Correlation
+    Filters", CVPR 2010.
+
+    Parameters
+    ----------
+    patch_size:
+        Size (px) of the square template used for the FFT.  The search window
+        and ball patches are all resized to this size before correlation.
+        Default ``32``.
+    lr:
+        Online learning rate (``η`` in the paper).  Each update mixes the
+        new filter estimate with the accumulated one: ``A ← (1-η)A + η·A_new``.
+        Default ``0.125``.
+    response_sigma:
+        Standard deviation (in patch pixels) of the desired Gaussian response
+        peak.  Smaller values force a sharper peak.  Default ``2.0``.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 32,
+        lr: float = 0.125,
+        response_sigma: float = 2.0,
+    ) -> None:
+        self._ps = patch_size
+        self._lr = lr
+        self._initialized: bool = False
+
+        # Desired Gaussian response in frequency domain (centred peak)
+        cy_, cx_ = patch_size // 2, patch_size // 2
+        yi, xi = np.mgrid[0:patch_size, 0:patch_size]
+        g = np.exp(-((xi - cx_) ** 2 + (yi - cy_) ** 2) / (2 * response_sigma ** 2))
+        self._G: np.ndarray = np.fft.fft2(g)
+
+        # Hanning window — reduces spectral leakage at patch borders
+        h1 = np.hanning(patch_size)
+        self._hann: np.ndarray = np.outer(h1, h1)
+
+        # Accumulated filter numerator and denominator (online update)
+        self._A: np.ndarray | None = None   # Σ G_i · conj(F_i)
+        self._B: np.ndarray | None = None   # Σ F_i · conj(F_i)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _extract_patch(
+        self, gray: np.ndarray, cx: float, cy: float, radius: int
+    ) -> np.ndarray | None:
+        """Extract a (2·radius × 2·radius) grayscale patch centred on (cx, cy).
+
+        The patch is zero-padded when the ball is near the frame boundary.
+        Returns *None* if the image is too small for even a 1×1 patch.
+        """
+        h, w = gray.shape
+        side = 2 * radius
+        if side <= 0 or w <= 0 or h <= 0:
+            return None
+
+        icx = int(round(cx))
+        icy = int(round(cy))
+        x1, y1 = icx - radius, icy - radius
+        x2, y2 = x1 + side, y1 + side
+
+        # Fast path: patch fully inside the frame
+        if x1 >= 0 and y1 >= 0 and x2 <= w and y2 <= h:
+            return gray[y1:y2, x1:x2].astype(np.float64)
+
+        # Slow path: clamp and zero-pad
+        patch = np.zeros((side, side), dtype=np.float64)
+        sx1, sy1 = max(x1, 0), max(y1, 0)
+        sx2, sy2 = min(x2, w), min(y2, h)
+        if sx2 > sx1 and sy2 > sy1:
+            patch[sy1 - y1: sy2 - y1, sx1 - x1: sx2 - x1] = gray[sy1:sy2, sx1:sx2]
+        return patch
+
+    def _preprocess(self, patch: np.ndarray) -> np.ndarray:
+        """Resize → log-normalise → z-score → apply Hanning window."""
+        p = cv2.resize(patch, (self._ps, self._ps), interpolation=cv2.INTER_LINEAR)
+        p = p.astype(np.float64)
+        p = np.log1p(p)                               # log normalization
+        mu, sigma = p.mean(), p.std()
+        p = (p - mu) / (sigma + 1e-8)                # z-score
+        return p * self._hann                         # Hanning-windowed
+
+    # ── Public methods ────────────────────────────────────────────────────────
+
+    def initialize(
+        self, gray: np.ndarray, cx: float, cy: float, radius: int
+    ) -> bool:
+        """Initialise the filter from a single patch around ``(cx, cy)``.
+
+        Parameters
+        ----------
+        gray:
+            Grayscale frame (uint8 or float).
+        cx, cy:
+            Ball centre in frame coordinates.
+        radius:
+            Half-side of the extracted patch (px).
+
+        Returns
+        -------
+        bool
+            *True* on success, *False* if the patch could not be extracted.
+        """
+        patch = self._extract_patch(gray, cx, cy, radius)
+        if patch is None:
+            return False
+        F = np.fft.fft2(self._preprocess(patch))
+        self._A = self._G * np.conj(F)
+        self._B = F * np.conj(F) + 1e-5              # small regularisation
+        self._initialized = True
+        return True
+
+    def update(
+        self, gray: np.ndarray, cx: float, cy: float, radius: int
+    ) -> None:
+        """Update the filter with a *confirmed* ball position.
+
+        Only call this after a verified YOLO detection — never on predicted
+        positions, to avoid filter drift.
+        """
+        patch = self._extract_patch(gray, cx, cy, radius)
+        if patch is None:
+            return
+        if not self._initialized:
+            self.initialize(gray, cx, cy, radius)
+            return
+        F = np.fft.fft2(self._preprocess(patch))
+        new_A = self._G * np.conj(F)
+        new_B = F * np.conj(F) + 1e-5
+        self._A = (1.0 - self._lr) * self._A + self._lr * new_A
+        self._B = (1.0 - self._lr) * self._B + self._lr * new_B
+
+    def find(
+        self,
+        gray: np.ndarray,
+        cx_pred: float,
+        cy_pred: float,
+        search_radius: int,
+    ) -> tuple[float, float, float]:
+        """Search for the ball in a window around the predicted position.
+
+        The search window (``2·search_radius × 2·search_radius``) is resized
+        to ``patch_size × patch_size`` and correlated with the learned filter.
+        The peak in the response map gives the displacement; the
+        Peak-to-Sidelobe Ratio (PSR) quantifies confidence.
+
+        Parameters
+        ----------
+        gray:
+            Grayscale frame.
+        cx_pred, cy_pred:
+            Centre of the search window (predicted ball position).
+        search_radius:
+            Half-side of the search window (px).  Should be larger than the
+            maximum expected per-frame displacement.
+
+        Returns
+        -------
+        (found_cx, found_cy, psr):
+            Estimated ball position and PSR.  ``psr < psr_threshold``
+            indicates low confidence.
+        """
+        if not self._initialized:
+            return cx_pred, cy_pred, 0.0
+
+        raw = self._extract_patch(gray, cx_pred, cy_pred, search_radius)
+        if raw is None:
+            return cx_pred, cy_pred, 0.0
+
+        F = np.fft.fft2(self._preprocess(raw))
+        H = self._A / (self._B + 1e-5)               # learned filter
+        response = np.real(np.fft.ifft2(H * F))
+        response = np.fft.fftshift(response)
+
+        # Peak location
+        ry, rx = np.unravel_index(np.argmax(response), response.shape)
+        peak_val = float(response[ry, rx])
+
+        # PSR: sidelobe = everything outside 11×11 window around peak
+        sl = response.copy()
+        r1, r2 = max(ry - 5, 0), min(ry + 6, response.shape[0])
+        c1, c2 = max(rx - 5, 0), min(rx + 6, response.shape[1])
+        sl[r1:r2, c1:c2] = np.nan
+        sl_vals = sl[~np.isnan(sl)]
+        if sl_vals.size == 0:
+            return cx_pred, cy_pred, 0.0
+        sl_mean = float(sl_vals.mean())
+        sl_std = float(sl_vals.std()) + 1e-8
+        psr = (peak_val - sl_mean) / sl_std
+
+        # Convert peak offset in response space to frame pixel offset.
+        # Each cell of the (patch_size × patch_size) response corresponds to
+        # (2·search_radius / patch_size) pixels in the frame.
+        ps = self._ps
+        scale = (2.0 * search_radius) / ps
+        dc = (rx - ps // 2) * scale   # x offset (col)
+        dr = (ry - ps // 2) * scale   # y offset (row)
+
+        h, w = gray.shape
+        found_cx = float(np.clip(cx_pred + dc, 0, w - 1))
+        found_cy = float(np.clip(cy_pred + dr, 0, h - 1))
+
+        return found_cx, found_cy, float(psr)
+
+
+# ---------------------------------------------------------------------------
+# BallDCFTracker — detection-first tracker with MOSSE gap filling
+# ---------------------------------------------------------------------------
+
+class BallDCFTracker:
+    """Detection-first ball tracker with MOSSE correlation-filter gap filling.
+
+    Design principle
+    ~~~~~~~~~~~~~~~~
+    YOLO detections are **always accepted immediately** — no Kalman gating, no
+    smoothing.  This gives zero-latency response to instant direction changes
+    (kicks, bounces): when the ball jumps 200 px in one frame, YOLO detects it
+    at the new position and the tracker outputs that position directly.
+
+    When YOLO misses the ball (occlusion, motion blur, false negative), the
+    MOSSE filter searches for the ball by *appearance* in an expanded window
+    around the velocity-extrapolated position.  If the search confidence (PSR)
+    is above the threshold, the MOSSE result is used; otherwise the tracker
+    falls back to linear velocity extrapolation from recent detections.
+
+    Parameters
+    ----------
+    patch_size:
+        Template patch size (px) for the MOSSE FFT.  Default ``32``.
+    search_radius:
+        Half-side (px) of the MOSSE search window when YOLO misses.  The
+        effective search diameter is ``2 × search_radius``.  Default ``60``.
+    psr_threshold:
+        Minimum Peak-to-Sidelobe Ratio for a MOSSE result to be accepted.
+        Values below this fall back to velocity extrapolation.
+        Default ``7.0`` (MOSSE paper recommendation).
+    dcf_lr:
+        MOSSE online learning rate.  Default ``0.125``.
+    velocity_history:
+        Number of recent YOLO detections used to estimate the ball velocity
+        via median differencing.  Default ``5``.
+    max_gap_for_dcf:
+        Maximum consecutive frames without a YOLO detection for which the
+        MOSSE search is attempted.  Beyond this the tracker only extrapolates
+        (ball is likely lost).  Default ``5``.
+    """
+
+    def __init__(
+        self,
+        patch_size: int = 32,
+        search_radius: int = 60,
+        psr_threshold: float = 7.0,
+        dcf_lr: float = 0.125,
+        velocity_history: int = 5,
+        max_gap_for_dcf: int = 5,
+    ) -> None:
+        self._search_radius = search_radius
+        self._psr_threshold = psr_threshold
+        self._patch_radius = patch_size // 2   # half-side for template extraction
+        self._max_gap_for_dcf = max_gap_for_dcf
+
+        self._mosse = _MOSSEFilter(
+            patch_size=patch_size,
+            lr=dcf_lr,
+        )
+
+        # Ring buffer of recent (cx, cy) YOLO detections for velocity estimation
+        self._det_history: deque[tuple[float, float]] = deque(maxlen=velocity_history)
+
+        # State
+        self._last_cx: float | None = None
+        self._last_cy: float | None = None
+        self._initialized: bool = False
+        self._frames_since_detection: int = 0
+        self._last_gated: bool = False
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _to_gray(frame: np.ndarray) -> np.ndarray:
+        """Convert a BGR or grayscale frame to a grayscale uint8 array."""
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return frame
+
+    def _estimate_velocity(self) -> tuple[float, float] | None:
+        """Return (vx, vy) in px/frame from recent detection history, or *None*."""
+        hist = list(self._det_history)
+        if len(hist) < 2:
+            return None
+        diffs_x = [hist[i][0] - hist[i - 1][0] for i in range(1, len(hist))]
+        diffs_y = [hist[i][1] - hist[i - 1][1] for i in range(1, len(hist))]
+        return float(np.median(diffs_x)), float(np.median(diffs_y))
+
+    def _extrapolate(self) -> tuple[float, float]:
+        """Return a velocity-extrapolated position (1 frame forward)."""
+        vel = self._estimate_velocity()
+        if vel is None or self._last_cx is None:
+            return self._last_cx or 0.0, self._last_cy or 0.0
+        return (
+            float(self._last_cx + vel[0]),
+            float(self._last_cy + vel[1]),
+        )
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    def initialize(
+        self, cx: float, cy: float, frame: np.ndarray | None = None
+    ) -> None:
+        """Seed the tracker from the first observation.
+
+        Parameters
+        ----------
+        cx, cy:
+            Ball centre from the first YOLO detection.
+        frame:
+            Current video frame (BGR or gray).  When provided the MOSSE
+            filter is initialised immediately.
+        """
+        self._last_cx = cx
+        self._last_cy = cy
+        self._det_history.clear()
+        self._det_history.append((cx, cy))
+        self._initialized = True
+        self._frames_since_detection = 0
+        self._last_gated = False
+        self._mosse._initialized = False   # reset any stale filter state
+        if frame is not None:
+            gray = self._to_gray(frame)
+            self._mosse.initialize(gray, cx, cy, self._patch_radius)
+
+    def predict(
+        self, frame: np.ndarray | None = None
+    ) -> tuple[float, float]:
+        """Estimate ball position for a frame where YOLO produced no detection.
+
+        Strategy (in priority order):
+
+        1. **MOSSE search**: if a frame is provided, the filter is not yet in a
+           long gap (``frames_since_detection ≤ max_gap_for_dcf``), and the
+           search PSR exceeds ``psr_threshold`` → return the MOSSE result.
+        2. **Velocity extrapolation**: linear prediction from recent detections.
+
+        Returns
+        -------
+        (cx, cy):
+            Estimated ball centre.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`initialize` or :meth:`update`.
+        """
+        if not self._initialized:
+            raise RuntimeError(
+                "BallDCFTracker.initialize() must be called before predict()."
+            )
+        self._frames_since_detection += 1
+        self._last_gated = True
+
+        # Velocity-extrapolated prediction used as MOSSE search centre
+        pred_cx, pred_cy = self._extrapolate()
+
+        # MOSSE search if a frame is available and the gap is short
+        if (
+            frame is not None
+            and self._mosse._initialized
+            and self._frames_since_detection <= self._max_gap_for_dcf
+        ):
+            gray = self._to_gray(frame)
+            vel = self._estimate_velocity()
+            vel_mag = float(np.hypot(vel[0], vel[1])) if vel else 0.0
+            # Widen search radius proportionally to estimated ball speed
+            adaptive_radius = max(
+                self._search_radius,
+                int(vel_mag * self._frames_since_detection * 1.5),
+            )
+            found_cx, found_cy, psr = self._mosse.find(
+                gray, pred_cx, pred_cy, adaptive_radius
+            )
+            if psr >= self._psr_threshold:
+                logger.debug(
+                    "Ball DCF: MOSSE gap-fill at (%.1f, %.1f) PSR=%.1f",
+                    found_cx, found_cy, psr,
+                )
+                self._last_cx = found_cx
+                self._last_cy = found_cy
+                return found_cx, found_cy
+
+        # Fallback: velocity extrapolation
+        self._last_cx = pred_cx
+        self._last_cy = pred_cy
+        logger.debug(
+            "Ball DCF: velocity extrapolation to (%.1f, %.1f)", pred_cx, pred_cy
+        )
+        return pred_cx, pred_cy
+
+    def update(
+        self, cx: float, cy: float, frame: np.ndarray | None = None
+    ) -> tuple[float, float]:
+        """Accept a YOLO detection immediately and update the MOSSE model.
+
+        **The ball position is returned exactly as supplied by YOLO** — no
+        Kalman smoothing, no gating.  This is the key property that enables
+        zero-latency capture of instant direction changes from kicks.
+
+        If the filter has not been initialised yet it is seeded from
+        ``(cx, cy)`` and the raw position is returned.
+
+        Parameters
+        ----------
+        cx, cy:
+            Ball centre from YOLO (pixel coordinates).
+        frame:
+            Current video frame for MOSSE model update (optional but
+            recommended).
+
+        Returns
+        -------
+        (cx, cy):
+            Same as the input — the YOLO detection is passed through unchanged.
+        """
+        if not self._initialized:
+            self.initialize(cx, cy, frame)
+            return cx, cy
+
+        # Accept immediately — no gating
+        self._last_cx = cx
+        self._last_cy = cy
+        self._det_history.append((cx, cy))
+        self._frames_since_detection = 0
+        self._last_gated = False
+
+        # Update MOSSE appearance model
+        if frame is not None:
+            gray = self._to_gray(frame)
+            if not self._mosse._initialized:
+                self._mosse.initialize(gray, cx, cy, self._patch_radius)
+            else:
+                self._mosse.update(gray, cx, cy, self._patch_radius)
+
+        return cx, cy
+
+    def reset(self) -> None:
+        """Return the tracker to its uninitialised state."""
+        self._last_cx = None
+        self._last_cy = None
+        self._det_history.clear()
+        self._initialized = False
+        self._frames_since_detection = 0
+        self._last_gated = False
+        self._mosse._initialized = False
+        self._mosse._A = None
+        self._mosse._B = None
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def initialized(self) -> bool:
+        """*True* once :meth:`initialize` or the first :meth:`update` has run."""
+        return self._initialized
+
+    @property
+    def frames_since_detection(self) -> int:
+        """Consecutive frames without a YOLO detection (0 after every detection)."""
+        return self._frames_since_detection
+
+    @property
+    def last_measurement_gated(self) -> bool:
+        """Always *False* for YOLO updates; *True* during predict-only frames."""
+        return self._last_gated
+
+    @property
+    def laplacian_weight(self) -> float:
+        """Always 1.0 — retained for API compatibility with ``BallKalmanFilter``."""
+        return 1.0
+
+    @property
+    def position(self) -> tuple[float, float] | None:
+        """Current ball ``(cx, cy)``, or *None* if not yet initialized."""
+        if not self._initialized or self._last_cx is None:
+            return None
+        return float(self._last_cx), float(self._last_cy)
+
+    @property
+    def velocity(self) -> tuple[float, float] | None:
+        """Velocity estimate ``(vx, vy)`` in px/frame from recent detections."""
+        return self._estimate_velocity()
+

@@ -21,24 +21,22 @@ Architecture (updated)
    bboxes before IoU matching, preventing ID switches caused by camera panning
    or zooming.
 
-4. The **ball** is tracked with a **UKF with Laplacian-robust M-estimator**
-   (``BallKalmanFilter``).  Compared to the previous adaptive CA Kalman filter:
+4. The **ball** is tracked with a **detection-first + MOSSE correlation**
+   tracker (``BallDCFTracker``).  Key design properties:
 
-   * Still uses the 6-state CA model ``[cx, cy, vcx, vcy, acx, acy]`` with
-     DWNA Q (``sigma_acc = 30`` px/frame² by default).
-   * **UKF sigma points** (van der Merwe) propagate uncertainty correctly
-     through any nonlinear model and form the foundation for physics-based
-     extensions (drag, projectile arc).
-   * **Laplacian soft gating** replaces the old hard binary gate: the
-     M-estimator weight ``w = min(1, b/d)`` partially corrects even large
-     innovations — a kick causing ``d = 4`` receives **50 % correction on
-     frame 1** rather than 0 % (hard rejected), capturing instant trajectory
-     changes immediately.
-   * **Laplacian adaptive Q** scales by ``sqrt(NIS)`` (linear in Mahalanobis
-     distance ``d``), which is the correct choice for heavy-tailed Laplacian
-     process noise and activates earlier for moderate kicks.
-   * Only truly pathological measurements (``d > 30`` by default) are
-     discarded via the safety hard gate.
+   * **Zero-latency kick response**: YOLO detections are accepted immediately
+     without Kalman gating or smoothing.  A 200 px kick caused by a strike is
+     captured with 100 % accuracy on frame 1 (vs. 2 % with the previous
+     UKF+Laplacian approach once the filter had converged).
+   * **MOSSE DCF gap filling** (Bolme et al., CVPR 2010): when YOLO misses
+     the ball, a Minimum Output Sum of Squared Error correlation filter
+     searches for the ball by appearance in a window around the
+     velocity-extrapolated position.  Confidence is quantified by the
+     Peak-to-Sidelobe Ratio (PSR).
+   * **Velocity extrapolation** as a tertiary fallback for longer gaps.
+   * The previous ``BallKalmanFilter`` (UKF + Laplacian) is retained in
+     ``ball_kalman.py`` for backward compatibility but is no longer the
+     default.
 
 5. **Re-detection** every ``redetect_interval`` frames picks up players who
    enter the scene after frame 0.  All matching in the re-detection path also
@@ -61,7 +59,7 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from segmentation_tracking.ball_kalman import BallKalmanFilter
+from segmentation_tracking.ball_kalman import BallDCFTracker, BallKalmanFilter
 
 logger = logging.getLogger(__name__)
 
@@ -169,17 +167,17 @@ class SegmentationTracker:
         When *True*, estimate frame-to-frame ORB+RANSAC homography and warp
         previous-frame bboxes before IoU matching in the fallback path to
         compensate for camera motion.
-    ball_sigma_acc:
-        Acceleration-noise standard deviation (px/frame²) for the UKF ball
-        tracker.  Default ``30.0`` suits typical broadcast football footage.
-    ball_laplacian_b:
-        Laplacian M-estimator scale in Mahalanobis units.  Innovations with
-        ``d > ball_laplacian_b`` are soft-downweighted by ``b/d``.  Default
-        ``2.0``: kicks at d=4 receive 50 % correction (instant tracking),
-        extreme outliers at d=20 receive only 10 %.
-    ball_gate_chi2:
-        Hard gate threshold (chi² 2 DOF).  Only extreme outliers beyond this
-        value are discarded entirely.  Default ``900.0`` (d = 30).
+    ball_patch_size:
+        MOSSE DCF template size (px).  Default ``32``.  Larger values capture
+        more context around the ball; smaller values are faster.
+    ball_search_radius:
+        Half-side (px) of the MOSSE search window used when YOLO misses the
+        ball.  Default ``60`` (120 px diameter).  Increase for a faster ball
+        on a wide-angle camera.
+    ball_psr_threshold:
+        Minimum Peak-to-Sidelobe Ratio for a MOSSE result to be accepted.
+        Default ``7.0`` (as recommended in the MOSSE paper).  Lower values
+        accept noisier predictions; higher values are more conservative.
     """
 
     def __init__(
@@ -193,9 +191,9 @@ class SegmentationTracker:
         tracker: str = "botsort",
         max_age: int = 30,
         use_homography: bool = True,
-        ball_sigma_acc: float = 30.0,
-        ball_laplacian_b: float = 2.0,
-        ball_gate_chi2: float = 900.0,
+        ball_patch_size: int = 32,
+        ball_search_radius: int = 60,
+        ball_psr_threshold: float = 7.0,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -210,10 +208,10 @@ class SegmentationTracker:
         self._detector = None                # lazy-loaded YOLO model
         self._sam = None                     # lazy-loaded SAM2VideoPredictor
         self._next_player_id: int = 1
-        self._ball_kalman = BallKalmanFilter(
-            sigma_acc=ball_sigma_acc,
-            laplacian_b=ball_laplacian_b,
-            gate_chi2=ball_gate_chi2,
+        self._ball_tracker = BallDCFTracker(
+            patch_size=ball_patch_size,
+            search_radius=ball_search_radius,
+            psr_threshold=ball_psr_threshold,
         )
 
         # Path to customised tracker YAML written at init time
@@ -284,7 +282,7 @@ class SegmentationTracker:
         A single YOLO forward pass covers both person tracking (class 0)
         and ball detection (class 32).  Person detections carry persistent
         BoT-SORT IDs; ball detections are returned as a raw bbox (the
-        Kalman filter processes them in :meth:`_process_ball`).
+        correlation tracker processes them in :meth:`_process_ball`).
 
         Returns
         -------
@@ -741,10 +739,11 @@ class SegmentationTracker:
         ball_bbox: np.ndarray | None,
         seg_result: SegmentationResult,
     ) -> SegmentationResult:
-        """Update ball Kalman filter and populate *seg_result* ball fields.
+        """Update ball correlation tracker and populate *seg_result* ball fields.
 
-        When a detection is available the filter is updated; otherwise it
-        predicts forward (up to *max_age* consecutive frames without detection).
+        When a YOLO detection is available the tracker accepts it immediately
+        (no gating).  When no detection is available the MOSSE correlation
+        filter searches the frame, falling back to velocity extrapolation.
         """
         cx: float | None = None
         cy: float | None = None
@@ -752,10 +751,10 @@ class SegmentationTracker:
         if ball_bbox is not None:
             raw_cx = float((ball_bbox[0] + ball_bbox[2]) / 2)
             raw_cy = float((ball_bbox[1] + ball_bbox[3]) / 2)
-            cx, cy = self._ball_kalman.update(raw_cx, raw_cy)
-        elif self._ball_kalman.initialized:
-            if self._ball_kalman.frames_since_detection < self.max_age:
-                cx, cy = self._ball_kalman.predict()
+            cx, cy = self._ball_tracker.update(raw_cx, raw_cy, frame)
+        elif self._ball_tracker.initialized:
+            if self._ball_tracker.frames_since_detection < self.max_age:
+                cx, cy = self._ball_tracker.predict(frame)
 
         if cx is not None and cy is not None:
             ball_mask, ball_center = self._segment_ball_from_center(
@@ -783,7 +782,7 @@ class SegmentationTracker:
         2. In a second pass, run BoT-SORT per frame to obtain stable player IDs.
         3. For each frame, Hungarian-match BoT-SORT bboxes to SAM2 mask bboxes
            to combine ID stability with mask quality.
-        4. Apply ball Kalman filtering for smooth ball tracking.
+        4. Apply ball detection-first correlation tracking (instant kick response).
 
         Parameters
         ----------
@@ -798,7 +797,7 @@ class SegmentationTracker:
             One :class:`SegmentationResult` per processed frame, in order.
         """
         self._next_player_id = 1
-        self._ball_kalman.reset()
+        self._ball_tracker.reset()
 
         # -- Read first frame -------------------------------------------------
         cap = cv2.VideoCapture(video_path)
@@ -879,7 +878,7 @@ class SegmentationTracker:
             ):
                 seg_result = self._redetect_new_players(frame, seg_result, homography)
 
-            # Ball Kalman filter
+            # Ball correlation tracker (detection-first + MOSSE gap fill)
             seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
 
             results.append(seg_result)
