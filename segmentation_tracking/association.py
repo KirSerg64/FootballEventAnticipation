@@ -131,17 +131,27 @@ class BallTrack:
         a Kalman-filter prediction without a corresponding raw detection.
     mask:
         Binary mask for the ball, shape ``(H, W)``, or *None*.
+    source:
+        Source of the ball position.  One of:
+
+        * ``"detected"`` — stage-1 global YOLO detection.
+        * ``"roi"``      — stage-2 ROI YOLO detection (FRoG-MOT).
+        * ``"mosse"``    — MOSSE correlation filter gap-fill.
+        * ``"predicted"``— velocity extrapolation.
+        * ``"none"``     — tracker not yet initialised (should not appear).
     """
 
     center: tuple[float, float]
     bbox: np.ndarray | None = None
     mask: np.ndarray | None = None
+    source: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dictionary."""
         return {
             "ball_center": list(self.center),
             "bbox": self.bbox.tolist() if self.bbox is not None else None,
+            "source": self.source,
         }
 
 
@@ -222,6 +232,7 @@ def associate_poses_with_tracks(
             center=seg_result.ball_center,
             bbox=seg_result.ball_bbox,
             mask=seg_result.ball_mask,
+            source=getattr(seg_result, "ball_source", "none"),
         )
 
     # -- Extract pose detections ----------------------------------------------

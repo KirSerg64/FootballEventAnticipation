@@ -25,6 +25,7 @@ Optional flags::
     --mask_alpha         0.40             Segmentation overlay opacity
     --no_skeleton                         Disable skeleton rendering
     --no_ball                             Disable ball overlay
+    --ball_debug                          Colour-code ball by detection source + show stats HUD
     --export_json                         Export player_tracks.json + ball_track.json
     --redetect_interval  30               Re-run YOLO every N frames for new players
     --tracker            botsort          Primary tracker: botsort or bytetrack
@@ -123,6 +124,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no_ball", action="store_true",
         help="Disable ball overlay",
+    )
+    parser.add_argument(
+        "--ball_debug", action="store_true",
+        help=(
+            "Enable ball detection debug visualisation: colour-code ball by source "
+            "(green=DETECT, yellow-green=ROI, orange=MOSSE, red=PRED) and show a "
+            "cumulative detection-rate HUD in the top-right corner."
+        ),
     )
     parser.add_argument(
         "--export_json", action="store_true",
@@ -293,6 +302,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         mask_alpha=args.mask_alpha,
         show_skeleton=not args.no_skeleton,
         show_ball=not args.no_ball,
+        show_ball_debug=args.ball_debug,
     )
 
     # JSON export accumulators
@@ -348,7 +358,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 pt.team_label = team_classifier.get_team(pt.id)
 
         # -- Visualization ----------------------------------------------------
-        annotated = visualizer.draw_frame(frame, player_tracks, ball_track)
+        annotated = visualizer.draw_frame(frame, player_tracks, ball_track, frame_idx=frame_idx)
         writer.write(annotated)
 
         # -- JSON export ------------------------------------------------------

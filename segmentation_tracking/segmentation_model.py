@@ -141,6 +141,15 @@ class SegmentationResult:
     ball_mask: np.ndarray | None = None
     ball_bbox: np.ndarray | None = None
     ball_center: tuple[float, float] | None = None
+    ball_source: str = "none"
+    """Source of the ball position for this frame.
+
+    ``"detected"``  — stage-1 global YOLO detection.
+    ``"roi"``       — stage-2 ROI YOLO detection (FRoG-MOT).
+    ``"mosse"``     — MOSSE correlation filter gap-fill.
+    ``"predicted"`` — velocity extrapolation (no appearance evidence).
+    ``"none"``      — ball not visible / tracker not yet initialised.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +884,7 @@ class SegmentationTracker:
             raw_cx = float((ball_bbox[0] + ball_bbox[2]) / 2)
             raw_cy = float((ball_bbox[1] + ball_bbox[3]) / 2)
             cx, cy = self._ball_tracker.update(raw_cx, raw_cy, frame)
+            seg_result.ball_source = "detected"
         elif self._ball_tracker.initialized:
             if self._ball_tracker.frames_since_detection < self.max_age:
                 # Stage 2: ROI-based re-detection (FRoG-MOT stage-2 association)
@@ -890,9 +900,11 @@ class SegmentationTracker:
                         raw_cy = float((roi_bbox[1] + roi_bbox[3]) / 2)
                         cx, cy = self._ball_tracker.update(raw_cx, raw_cy, frame)
                         ball_bbox = roi_bbox   # use for mask ellipse size
+                        seg_result.ball_source = "roi"
                     else:
                         # Stage 3: MOSSE search / velocity extrapolation
                         cx, cy = self._ball_tracker.predict(frame)
+                        seg_result.ball_source = self._ball_tracker.last_source
 
         if cx is not None and cy is not None:
             ball_mask, ball_center = self._segment_ball_from_center(

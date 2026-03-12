@@ -125,6 +125,7 @@ Public API (primary)
     ``motion_state → BallMotionState``     – UNKNOWN/STATIC/IN_FLIGHT/HIGH_SPEED
     ``predicted_position → (cx,cy)|None`` – one-frame-ahead position estimate
     ``adaptive_search_radius → int``       – ROI radius scaled by speed and gap
+    ``last_source → str``                  – "detected"/"mosse"/"predicted"/"none"
     ``initialized``                        – True once seeded
     ``frames_since_detection``             – consecutive frames without YOLO
     ``last_measurement_gated``             – always False (DCF never gates)
@@ -982,6 +983,8 @@ class BallDCFTracker:
         self._initialized: bool = False
         self._frames_since_detection: int = 0
         self._last_gated: bool = False
+        # Source of the most-recent ball position: "detected", "mosse", "predicted"
+        self._last_source: str = "none"
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1064,6 +1067,7 @@ class BallDCFTracker:
         self._initialized = True
         self._frames_since_detection = 0
         self._last_gated = False
+        self._last_source = "detected"
         self._mosse._initialized = False   # reset any stale filter state
         if frame is not None:
             gray = self._to_gray(frame)
@@ -1125,11 +1129,13 @@ class BallDCFTracker:
                 )
                 self._last_cx = found_cx
                 self._last_cy = found_cy
+                self._last_source = "mosse"
                 return found_cx, found_cy
 
         # Fallback: velocity extrapolation
         self._last_cx = pred_cx
         self._last_cy = pred_cy
+        self._last_source = "predicted"
         logger.debug(
             "Ball DCF: velocity extrapolation to (%.1f, %.1f)", pred_cx, pred_cy
         )
@@ -1170,6 +1176,7 @@ class BallDCFTracker:
         self._det_history.append((cx, cy))
         self._frames_since_detection = 0
         self._last_gated = False
+        self._last_source = "detected"
 
         # Update MOSSE appearance model
         if frame is not None:
@@ -1189,6 +1196,7 @@ class BallDCFTracker:
         self._initialized = False
         self._frames_since_detection = 0
         self._last_gated = False
+        self._last_source = "none"
         self._mosse._initialized = False
         self._mosse._A = None
         self._mosse._B = None
@@ -1214,6 +1222,24 @@ class BallDCFTracker:
     def laplacian_weight(self) -> float:
         """Always 1.0 — retained for API compatibility with ``BallKalmanFilter``."""
         return 1.0
+
+    @property
+    def last_source(self) -> str:
+        """Source of the most-recent ball position estimate.
+
+        Possible values:
+
+        * ``"detected"`` — position came from a YOLO detection (stage-1 global
+          or stage-2 ROI); the tracker accepted it immediately.
+        * ``"mosse"`` — MOSSE correlation filter found the ball in a gap frame.
+        * ``"predicted"`` — velocity extrapolation (MOSSE not available or PSR
+          too low).
+        * ``"none"`` — tracker has not yet been initialised.
+
+        This property is used by :class:`SegmentationTracker` to populate
+        ``SegmentationResult.ball_source`` for visualisation and diagnostics.
+        """
+        return self._last_source
 
     @property
     def position(self) -> tuple[float, float] | None:
