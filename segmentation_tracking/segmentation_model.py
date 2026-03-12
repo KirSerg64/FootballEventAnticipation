@@ -22,21 +22,29 @@ Architecture (updated)
    or zooming.
 
 4. The **ball** is tracked with a **detection-first + MOSSE correlation**
-   tracker (``BallDCFTracker``).  Key design properties:
+   tracker (``BallDCFTracker``) extended with **FRoG-MOT inspired two-stage
+   detection and motion-state aware prediction**.
 
    * **Zero-latency kick response**: YOLO detections are accepted immediately
-     without Kalman gating or smoothing.  A 200 px kick caused by a strike is
-     captured with 100 % accuracy on frame 1 (vs. 2 % with the previous
-     UKF+Laplacian approach once the filter had converged).
-   * **MOSSE DCF gap filling** (Bolme et al., CVPR 2010): when YOLO misses
-     the ball, a Minimum Output Sum of Squared Error correlation filter
-     searches for the ball by appearance in a window around the
-     velocity-extrapolated position.  Confidence is quantified by the
-     Peak-to-Sidelobe Ratio (PSR).
+     without Kalman gating or smoothing.
+   * **Stage-1 detection**: global YOLO call with a dedicated
+     ``ball_conf_threshold`` (default 0.10, much lower than the player
+     threshold 0.25).  A fast-moving ball under motion blur has low YOLO
+     confidence; the reduced threshold captures it without flooding the
+     player tracker with false positives (BoT-SORT uses its own
+     ``track_high_thresh = 0.25`` internally).
+   * **Stage-2 detection** (FRoG-MOT stage-2 association): when the ball is
+     not found globally, crop the predicted ROI and run YOLO at an even
+     lower ``ball_conf_roi`` (default 0.05).  Restricting the search area
+     eliminates most false positives and allows ultra-low confidence
+     acceptance.
+   * **Motion-state aware prediction** (FRoG-MOT motion-state model):
+     ``BallDCFTracker`` classifies the ball as STATIC / IN_FLIGHT /
+     HIGH_SPEED and selects the appropriate prediction: hold / median
+     velocity / latest frame-to-frame displacement.
+   * **MOSSE DCF gap filling** (Bolme et al., CVPR 2010): appearance-based
+     correlation search when YOLO misses and the gap is short.
    * **Velocity extrapolation** as a tertiary fallback for longer gaps.
-   * The previous ``BallKalmanFilter`` (UKF + Laplacian) is retained in
-     ``ball_kalman.py`` for backward compatibility but is no longer the
-     default.
 
 5. **Re-detection** every ``redetect_interval`` frames picks up players who
    enter the scene after frame 0.  All matching in the re-detection path also
@@ -178,6 +186,18 @@ class SegmentationTracker:
         Minimum Peak-to-Sidelobe Ratio for a MOSSE result to be accepted.
         Default ``7.0`` (as recommended in the MOSSE paper).  Lower values
         accept noisier predictions; higher values are more conservative.
+    ball_conf_threshold:
+        YOLO confidence threshold used **specifically for ball detection** in
+        the global pass.  Default ``0.10`` — considerably lower than the
+        player threshold (``conf_threshold``) so that a fast-moving ball
+        under motion blur (typical confidence 0.05–0.15) is still detected.
+        BoT-SORT uses its own ``track_high_thresh`` for player track
+        management and is unaffected by this lower value.
+    ball_conf_roi:
+        Confidence threshold for the **ROI-based secondary ball detection**
+        pass (FRoG-MOT stage-2).  Default ``0.05``.  After restricting the
+        search to the predicted ball region, false positives are rare even
+        at this very low threshold.
     """
 
     def __init__(
@@ -194,6 +214,8 @@ class SegmentationTracker:
         ball_patch_size: int = 32,
         ball_search_radius: int = 60,
         ball_psr_threshold: float = 7.0,
+        ball_conf_threshold: float = 0.10,
+        ball_conf_roi: float = 0.05,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -204,6 +226,8 @@ class SegmentationTracker:
         self.tracker = tracker.lower().replace(".yaml", "")
         self.max_age = max_age
         self.use_homography = use_homography
+        self.ball_conf_threshold = ball_conf_threshold
+        self.ball_conf_roi = ball_conf_roi
 
         self._detector = None                # lazy-loaded YOLO model
         self._sam = None                     # lazy-loaded SAM2VideoPredictor
@@ -293,11 +317,16 @@ class SegmentationTracker:
             or *None*.
         """
         det = self._get_detector()
+        # Use the lower of the two thresholds so that low-confidence ball
+        # detections pass through the YOLO forward pass.  BoT-SORT applies
+        # its own track_high_thresh (= conf_threshold) for player track
+        # creation/maintenance and is unaffected by the lower value.
+        _eff_conf = min(self.conf_threshold, self.ball_conf_threshold)
         results = det.track(
             frame,
             persist=True,
             tracker=self._tracker_config_path,
-            conf=self.conf_threshold,
+            conf=_eff_conf,
             classes=[_PERSON_CLS, _BALL_CLS],
             verbose=False,
         )
@@ -317,7 +346,7 @@ class SegmentationTracker:
                         if r.boxes.id is not None and i < len(r.boxes.id):
                             tid = int(r.boxes.id[i].item())
                             player_tracks[tid] = bbox
-                    elif cls == _BALL_CLS and conf > best_ball_conf:
+                    elif cls == _BALL_CLS and conf >= self.ball_conf_threshold and conf > best_ball_conf:
                         ball_bbox = bbox
                         best_ball_conf = conf
 
@@ -354,6 +383,87 @@ class SegmentationTracker:
         return player_bboxes, ball_bbox
 
     # -- Ball helpers ---------------------------------------------------------
+
+    def _detect_ball_in_roi(
+        self,
+        frame: np.ndarray,
+        pred_cx: float,
+        pred_cy: float,
+        radius: int,
+    ) -> np.ndarray | None:
+        """FRoG-MOT stage-2: low-confidence ball detection within predicted ROI.
+
+        When the global YOLO pass misses the ball (e.g. motion blur during a
+        pass), this method crops the predicted region and runs YOLO again at
+        ``self.ball_conf_roi`` (default 0.05).  Restricting the search area
+        eliminates most false positives, making ultra-low confidence viable.
+
+        Parameters
+        ----------
+        frame:
+            Full BGR video frame.
+        pred_cx, pred_cy:
+            Centre of the predicted ball position (from the tracker).
+        radius:
+            Half-side (px) of the search region.  The ROI is a
+            ``(2·radius × 2·radius)`` px crop centred on the prediction.
+
+        Returns
+        -------
+        np.ndarray | None
+            ``[x1, y1, x2, y2]`` in **frame coordinates** for the
+            best ball detection inside the ROI, or *None* if not found.
+        """
+        h, w = frame.shape[:2]
+        x1 = max(0, int(pred_cx - radius))
+        y1 = max(0, int(pred_cy - radius))
+        x2 = min(w, int(pred_cx + radius))
+        y2 = min(h, int(pred_cy + radius))
+
+        if x2 <= x1 or y2 <= y1 or radius < 10:
+            return None
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        det = self._get_detector()
+        try:
+            results = det.predict(
+                roi,
+                conf=self.ball_conf_roi,
+                classes=[_BALL_CLS],
+                verbose=False,
+            )
+        except Exception as exc:
+            logger.debug("ROI ball detection failed: %s", exc)
+            return None
+
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+            return None
+
+        best_conf = -1.0
+        best_bbox: np.ndarray | None = None
+        for box in results[0].boxes:
+            conf = float(box.conf[0].item())
+            if conf > best_conf:
+                xyxy = box.xyxy[0].cpu().numpy().astype(np.float32)
+                # Translate ROI-local coords → frame coords
+                best_bbox = np.array(
+                    [xyxy[0] + x1, xyxy[1] + y1, xyxy[2] + x1, xyxy[3] + y1],
+                    dtype=np.float32,
+                )
+                best_conf = conf
+
+        if best_bbox is not None:
+            logger.debug(
+                "Ball ROI detection: conf=%.3f at (%.0f,%.0f) pred=(%.0f,%.0f)",
+                best_conf,
+                (best_bbox[0] + best_bbox[2]) / 2,
+                (best_bbox[1] + best_bbox[3]) / 2,
+                pred_cx, pred_cy,
+            )
+        return best_bbox
 
     @staticmethod
     def _segment_ball_from_center(
@@ -739,22 +849,50 @@ class SegmentationTracker:
         ball_bbox: np.ndarray | None,
         seg_result: SegmentationResult,
     ) -> SegmentationResult:
-        """Update ball correlation tracker and populate *seg_result* ball fields.
+        """Update ball tracker and populate *seg_result* ball fields.
 
-        When a YOLO detection is available the tracker accepts it immediately
-        (no gating).  When no detection is available the MOSSE correlation
-        filter searches the frame, falling back to velocity extrapolation.
+        Two-stage detection strategy (FRoG-MOT):
+
+        **Stage 1 — Global YOLO** (performed in :meth:`_track_frame`):
+            Ball detected at ``ball_conf_threshold`` (default 0.10).  Position
+            accepted immediately — no gating, no smoothing.
+
+        **Stage 2 — ROI YOLO** (FRoG-MOT stage-2 association):
+            When Stage 1 misses, the tracker's ``predicted_position`` and
+            ``adaptive_search_radius`` are used to crop the frame and re-run
+            YOLO at ``ball_conf_roi`` (default 0.05).  False-positive rate is
+            low because the search area is small.  A successful ROI detection
+            is treated as a confirmed YOLO detection and updates the tracker.
+
+        **Stage 3 — MOSSE / velocity extrapolation**:
+            Fallback when both YOLO passes fail.
         """
         cx: float | None = None
         cy: float | None = None
 
         if ball_bbox is not None:
+            # Stage 1: global YOLO detection accepted immediately
             raw_cx = float((ball_bbox[0] + ball_bbox[2]) / 2)
             raw_cy = float((ball_bbox[1] + ball_bbox[3]) / 2)
             cx, cy = self._ball_tracker.update(raw_cx, raw_cy, frame)
         elif self._ball_tracker.initialized:
             if self._ball_tracker.frames_since_detection < self.max_age:
-                cx, cy = self._ball_tracker.predict(frame)
+                # Stage 2: ROI-based re-detection (FRoG-MOT stage-2 association)
+                pred_pos = self._ball_tracker.predicted_position
+                if pred_pos is not None:
+                    roi_radius = self._ball_tracker.adaptive_search_radius
+                    roi_bbox = self._detect_ball_in_roi(
+                        frame, pred_pos[0], pred_pos[1], roi_radius
+                    )
+                    if roi_bbox is not None:
+                        # Treat ROI detection as a confirmed detection
+                        raw_cx = float((roi_bbox[0] + roi_bbox[2]) / 2)
+                        raw_cy = float((roi_bbox[1] + roi_bbox[3]) / 2)
+                        cx, cy = self._ball_tracker.update(raw_cx, raw_cy, frame)
+                        ball_bbox = roi_bbox   # use for mask ellipse size
+                    else:
+                        # Stage 3: MOSSE search / velocity extrapolation
+                        cx, cy = self._ball_tracker.predict(frame)
 
         if cx is not None and cy is not None:
             ball_mask, ball_center = self._segment_ball_from_center(

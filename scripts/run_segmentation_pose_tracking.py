@@ -36,6 +36,8 @@ Optional flags::
     --ball_patch_size    32               Ball DCF MOSSE template patch size (px)
     --ball_search_radius 60               Ball DCF MOSSE search half-radius (px)
     --ball_psr_threshold 7.0             Ball DCF MOSSE PSR acceptance threshold
+    --ball_conf          0.10            Ball YOLO confidence threshold (stage-1, lower than player conf)
+    --ball_conf_roi      0.05            Ball YOLO confidence for ROI re-detection (stage-2, FRoG-MOT)
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -185,6 +187,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ball_conf", type=float, default=0.10,
+        help=(
+            "Ball detection confidence threshold for the global YOLO pass (stage-1, default: 0.10). "
+            "Lower than the player threshold (--conf) so motion-blurred fast balls are detected. "
+            "BoT-SORT uses its own track_high_thresh for player tracks and is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--ball_conf_roi", type=float, default=0.05,
+        help=(
+            "Ball detection confidence for ROI-based re-detection (stage-2 / FRoG-MOT, default: 0.05). "
+            "Applied only within the predicted ball region, so false-positive rate stays low."
+        ),
+    )
+    parser.add_argument(
         "--codec", default="mp4v",
         help=(
             "FourCC video codec for the output file (default: mp4v). "
@@ -250,6 +267,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ball_patch_size=args.ball_patch_size,
         ball_search_radius=args.ball_search_radius,
         ball_psr_threshold=args.ball_psr_threshold,
+        ball_conf_threshold=args.ball_conf,
+        ball_conf_roi=args.ball_conf_roi,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))

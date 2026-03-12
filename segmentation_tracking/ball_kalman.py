@@ -121,6 +121,10 @@ Public API (primary)
     ``update(cx, cy[, frame]) → (cx,cy)`` – accept detection immediately
     ``position → (cx, cy) | None``        – current position
     ``velocity → (vcx, vcy) | None``      – velocity from recent detections
+    ``speed → float``                      – scalar speed (px/frame)
+    ``motion_state → BallMotionState``     – UNKNOWN/STATIC/IN_FLIGHT/HIGH_SPEED
+    ``predicted_position → (cx,cy)|None`` – one-frame-ahead position estimate
+    ``adaptive_search_radius → int``       – ROI radius scaled by speed and gap
     ``initialized``                        – True once seeded
     ``frames_since_detection``             – consecutive frames without YOLO
     ``last_measurement_gated``             – always False (DCF never gates)
@@ -135,6 +139,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from enum import Enum
 
 import cv2
 import numpy as np
@@ -147,6 +152,36 @@ _CHI2_99_2DOF = 9.210   # sqrt → d = 3.033; kept for reference
 
 # Default hard gate (only for truly extreme outliers, d > 30)
 _HARD_GATE_CHI2 = 900.0
+
+# Speed thresholds for BallMotionState classification (px/frame)
+_SPEED_STATIC = 3.0    # below this → STATIC (ball nearly stationary)
+_SPEED_HIGH   = 25.0   # above this → HIGH_SPEED (kick or pass)
+
+
+class BallMotionState(Enum):
+    """Ball motion-state classification (FRoG-MOT inspired).
+
+    Used by :class:`BallDCFTracker` to switch between prediction strategies:
+
+    * ``UNKNOWN`` — insufficient detection history.
+    * ``STATIC`` — ball nearly stationary (speed < ``_SPEED_STATIC`` px/frame).
+      Prediction: hold the last known position (velocity is noise).
+    * ``IN_FLIGHT`` — moderate speed (``_SPEED_STATIC`` ≤ speed < ``_SPEED_HIGH``).
+      Prediction: median velocity over recent detections (smooth estimate).
+    * ``HIGH_SPEED`` — fast kick or pass (speed ≥ ``_SPEED_HIGH`` px/frame).
+      Prediction: most-recent frame-to-frame displacement (direction is precise,
+      median would lag behind the sudden change).
+
+    Reference: FRoG-MOT (Fast and Robust Generic MOT by IoU and Motion-State
+    Associations).  The core idea is that each tracked object has a *motion
+    state*, and prediction accuracy improves when the model is adapted to
+    that state rather than using a single fixed dynamics model.
+    """
+
+    UNKNOWN    = 0
+    STATIC     = 1
+    IN_FLIGHT  = 2
+    HIGH_SPEED = 3
 
 
 def _build_dwna_q(sigma_acc: float, dt: float = 1.0) -> np.ndarray:
@@ -883,6 +918,20 @@ class BallDCFTracker:
     is above the threshold, the MOSSE result is used; otherwise the tracker
     falls back to linear velocity extrapolation from recent detections.
 
+    FRoG-MOT motion-state extensions
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Inspired by FRoG-MOT (Fast and Robust Generic MOT by IoU and Motion-State
+    Associations), the tracker classifies the ball into one of four motion
+    states (:class:`BallMotionState`) and adapts both prediction and search
+    accordingly:
+
+    * ``HIGH_SPEED`` (kick / pass, ≥ ``_SPEED_HIGH`` px/frame) → use the
+      most-recent frame-to-frame displacement for prediction (no smoothing);
+      widen the search window proportionally to speed.
+    * ``IN_FLIGHT`` (normal flight) → median velocity (stable estimate).
+    * ``STATIC`` (stationary ball) → hold current position.
+    * ``UNKNOWN`` (insufficient history) → median velocity.
+
     Parameters
     ----------
     patch_size:
@@ -953,13 +1002,44 @@ class BallDCFTracker:
         return float(np.median(diffs_x)), float(np.median(diffs_y))
 
     def _extrapolate(self) -> tuple[float, float]:
-        """Return a velocity-extrapolated position (1 frame forward)."""
-        vel = self._estimate_velocity()
-        if vel is None or self._last_cx is None:
-            return self._last_cx or 0.0, self._last_cy or 0.0
+        """Position extrapolation one frame forward, motion-state aware.
+
+        Motion-state strategy (FRoG-MOT):
+
+        * ``HIGH_SPEED`` — use the **most-recent** frame-to-frame displacement
+          only.  During a kick the ball travels in a well-defined direction; the
+          median of older frames would under-estimate speed and trail the ball.
+        * ``STATIC`` — return the current position unchanged.  Small random
+          movements are noise, not real motion.
+        * ``IN_FLIGHT`` / ``UNKNOWN`` — use the **median** velocity over recent
+          detections.  More stable in normal free-flight.
+        """
+        if self._last_cx is None:
+            return 0.0, 0.0
+
+        state = self.motion_state
+
+        if state == BallMotionState.STATIC:
+            return float(self._last_cx), float(self._last_cy)
+
+        if state == BallMotionState.HIGH_SPEED:
+            hist = list(self._det_history)
+            if len(hist) >= 2:
+                vx = hist[-1][0] - hist[-2][0]
+                vy = hist[-1][1] - hist[-2][1]
+            else:
+                vel = self._estimate_velocity()
+                vx, vy = vel if vel is not None else (0.0, 0.0)
+        else:
+            # IN_FLIGHT or UNKNOWN: median over history
+            vel = self._estimate_velocity()
+            if vel is None:
+                return float(self._last_cx), float(self._last_cy)
+            vx, vy = vel
+
         return (
-            float(self._last_cx + vel[0]),
-            float(self._last_cy + vel[1]),
+            float(self._last_cx + vx),
+            float(self._last_cy + vy),
         )
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -1146,4 +1226,71 @@ class BallDCFTracker:
     def velocity(self) -> tuple[float, float] | None:
         """Velocity estimate ``(vx, vy)`` in px/frame from recent detections."""
         return self._estimate_velocity()
+
+    @property
+    def speed(self) -> float:
+        """Ball speed (px/frame) from the **most-recent** frame-to-frame displacement.
+
+        Using the latest pair (rather than the median) gives an immediate
+        reading when the ball is kicked — the FRoG-MOT principle of
+        classifying the *current* motion state from the *current* observation.
+        """
+        hist = list(self._det_history)
+        if len(hist) < 2:
+            return 0.0
+        vx = hist[-1][0] - hist[-2][0]
+        vy = hist[-1][1] - hist[-2][1]
+        return float(np.hypot(vx, vy))
+
+    @property
+    def motion_state(self) -> BallMotionState:
+        """Ball motion state (FRoG-MOT motion-state classification).
+
+        Classifies from the **most-recent** frame-to-frame speed so that
+        a sudden kick is detected on the very next detection, without waiting
+        for a median to catch up.
+        """
+        hist = list(self._det_history)
+        if len(hist) < 2:
+            return BallMotionState.UNKNOWN
+        vx = hist[-1][0] - hist[-2][0]
+        vy = hist[-1][1] - hist[-2][1]
+        spd = float(np.hypot(vx, vy))
+        if spd < _SPEED_STATIC:
+            return BallMotionState.STATIC
+        if spd >= _SPEED_HIGH:
+            return BallMotionState.HIGH_SPEED
+        return BallMotionState.IN_FLIGHT
+
+    @property
+    def predicted_position(self) -> tuple[float, float] | None:
+        """Ball position predicted one frame forward (without advancing state).
+
+        Used by external callers (e.g. :meth:`SegmentationTracker._process_ball`)
+        to centre the ROI for secondary low-confidence YOLO detection.
+        Returns *None* if the tracker has not been initialised.
+        """
+        if not self._initialized or self._last_cx is None:
+            return None
+        return self._extrapolate()
+
+    @property
+    def adaptive_search_radius(self) -> int:
+        """Search half-radius (px) for ROI-based re-detection.
+
+        Scales proportionally to the **most-recent** frame-to-frame speed
+        (so a kick immediately widens the search window) and the number of
+        frames since the last confirmed YOLO detection.
+        """
+        hist = list(self._det_history)
+        if len(hist) >= 2:
+            vx = hist[-1][0] - hist[-2][0]
+            vy = hist[-1][1] - hist[-2][1]
+            spd = float(np.hypot(vx, vy))
+        else:
+            vel = self._estimate_velocity()
+            spd = float(np.hypot(vel[0], vel[1])) if vel is not None else 0.0
+        gap = max(1, self._frames_since_detection)
+        extra = int(spd * gap * 1.5)
+        return int(min(self._search_radius + extra, 350))
 
