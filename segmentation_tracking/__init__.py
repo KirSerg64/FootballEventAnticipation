@@ -8,7 +8,7 @@ Modules:
     segmentation_model  -- BoT-SORT + SAM2 tracker for players and ball
     association         -- Hungarian pose-to-mask matching
     visualization       -- Frame annotation with masks, IDs, and skeletons
-    ball_kalman         -- Adaptive CA Kalman filter for ball centre tracking (replaces CV filter)
+    ball_kalman         -- UKF with Laplacian-robust M-estimator for ball centre tracking
     team_classifier     -- HSV K-means jersey-colour team classifier
 """
 

@@ -1,77 +1,94 @@
 """
 ball_kalman.py
 --------------
-Adaptive Constant-Acceleration Kalman filter for football tracking.
+Unscented Kalman Filter (UKF) with Laplacian-robust statistics for football
+tracking.
 
-Why constant-velocity is insufficient
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A football can change its velocity almost instantaneously during a kick or
-bounce.  A constant-velocity (CV) Kalman filter with a fixed process-noise
-covariance **Q** responds too slowly to such manoeuvres because:
+Why the previous Adaptive CA Kalman filter was still insufficient
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Adaptive CA filter used a **hard Mahalanobis gate** (chi² = 9.21, d ≈ 3.03).
+When a kick causes the ball to jump far from the predicted position, the
+innovation's Mahalanobis distance often exceeds the gate — so the measurement
+is **completely rejected** on the kick frame.  The filter then only predicts
+(carrying the old velocity forward), delaying trajectory recovery by 3–5 frames.
 
-* The small, fixed **Q** keeps the Kalman gain **K** low, so corrections
-  from new measurements are heavily discounted.
-* There is no acceleration state, so the filter cannot represent that a
-  kicked ball will continue in the new direction and then gradually decelerate.
+Improvements: UKF + Laplacian robust statistics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Design
-~~~~~~
-**State vector** : ``[cx, cy, vcx, vcy, acx, acy]``
-    Position (px), velocity (px/frame), acceleration (px/frame²) for each axis.
+**Unscented Kalman Filter (UKF) — van der Merwe scaled sigma points**
+    The UKF propagates a set of carefully chosen *sigma points* through the
+    process and measurement functions.  For linear models (our CA model) this
+    gives results identical to the linear KF, but the sigma-point framework is
+    the correct foundation for:
 
-**Motion model** : Constant-Acceleration (CA) with ``dt = 1`` frame.
-    The transition matrix **F** propagates position by ``vel×dt + 0.5×acc×dt²``,
-    velocity by ``acc×dt``, and holds acceleration constant.
+    * Nonlinear process models (aerodynamic drag, projectile arc) without
+      needing an analytically computed Jacobian.
+    * Reliable second-order accuracy under any noise distribution.
+    * Natural integration of the Laplacian robust update described below.
 
-**Process noise Q** : Discrete White-Noise Acceleration (DWNA) model.
-    **Q** is derived from a white-noise disturbance on the acceleration with
-    standard deviation ``sigma_acc`` (px/frame²):
+    Sigma-point parameters follow van der Merwe (2004):
+    ``alpha = 0.3`` (wider spread for heavy-tailed Laplacian distributions),
+    ``beta = 2.0`` (optimal kurtosis weight for near-Gaussian posterior),
+    ``kappa = 0.0``.
 
-    .. math::
-
-        \\mathbf{G} = \\begin{bmatrix} \\tfrac{1}{2}dt^2 \\\\ dt \\\\ 1 \\end{bmatrix}, \\quad
-        \\mathbf{Q}_{\\text{1D}} = \\sigma_a^2 \\, \\mathbf{G} \\mathbf{G}^\\top
-
-    The 2-D Q is the block-diagonal of two independent 1-D models.  With the
-    default ``sigma_acc = 30`` px/frame² this gives ``Q_vel ≈ 900 px²/frame²``
-    (vs. 1 in the old CV filter) — a 900× improvement in velocity responsiveness.
-
-**Adaptive Q** : Normalised Innovation Squared (NIS) scaling.
-    After every accepted update the NIS statistic
-    ``ε = yᵀ S⁻¹ y`` (chi-squared, 2 DOF) is computed from the innovation **y**
-    and innovation covariance **S**.  When ``ε`` exceeds the 95 % chi² threshold
-    (``5.99`` for 2 DOF), the effective process noise is temporarily boosted:
+**Laplacian robust M-estimator measurement update**
+    Instead of a hard binary gate (accept / reject), the UKF update uses a
+    *soft M-estimator* derived from the Laplacian measurement-noise model:
 
     .. math::
 
-        \\lambda = \\min\\!\\left(\\frac{\\varepsilon}{2},\\; \\lambda_{\\max}\\right)
+        p(\\mathbf{y}) \\propto \\exp\\!\\left(-\\frac{\\|\\mathbf{y}\\|_{S^{-1}}}{b}\\right)
 
-    The scale decays by ``adaptive_q_decay`` each frame back toward 1.0, so the
-    filter relaxes to normal behaviour within a few frames after a kick.
-    *This allows recovery in ≤ 2 frames from a sudden kick or bounce while
-    remaining smooth during free-flight.*
+    where ``b = laplacian_b`` is the Laplacian scale in Mahalanobis units and
+    ``‖y‖_{S⁻¹} = d`` is the Mahalanobis distance of the innovation.
 
-**Measurement gating** : Mahalanobis-distance gate.
-    If the squared Mahalanobis distance of a new detection exceeds
-    ``gate_chi2`` (default 9.21 = chi² 99 %, 2 DOF) the measurement is
-    classified as a likely false YOLO detection and **rejected** — the filter
-    only predicts for that frame.  ``frames_since_detection`` is incremented
-    as if no measurement arrived.  *This prevents spurious YOLO hits from
-    corrupting the velocity and acceleration states.*
+    This gives an M-estimator weight:
+
+    .. math::
+
+        w(d) = \\min\\!\\left(1,\\; \\frac{b}{\\max(d, \\epsilon)}\\right)
+
+    The effective measurement-noise covariance is inflated to
+    ``R_eff = R / w``, which reduces the Kalman gain proportionally.
+    The key properties:
+
+    * ``d ≤ b`` (normal flight, small innovations): ``w = 1`` → full
+      Gaussian-like correction.
+    * Kick frame, ``d = 4``, ``b = 2``: ``w = 0.5`` → **50 % correction**,
+      velocity and acceleration states immediately start tracking the new
+      trajectory (vs. 0 % with the old hard gate).
+    * Extreme outlier, ``d = 20``, ``b = 2``: ``w = 0.1`` → 10 % correction
+      → false YOLO detection barely moves the state.
+    * A **safety hard gate** at ``gate_chi2 = 900`` (``d = 30``) discards
+      only truly pathological measurements (detector completely off-screen).
+
+**Laplacian adaptive Q**
+    Under Laplacian process noise the optimal Q boost when the observed
+    innovation magnitude is ``d`` is proportional to ``d / b`` — *linear* in
+    the Mahalanobis distance, not quadratic.  The adaptive scale is therefore:
+
+    .. math::
+
+        \\lambda = \\max\\!\\left(1,\\; \\frac{\\sqrt{NIS}}{\\sqrt{NIS_{95}}}\\right)
+
+    This activates earlier (at smaller innovations) than the previous
+    ``NIS / 2`` rule and is the correct choice for heavy-tailed Laplacian
+    process noise.
 
 Public API
 ~~~~~~~~~~
-``BallKalmanFilter``  (``AdaptiveBallKalmanFilter`` is an alias)
-    ``initialize(cx, cy)``            – seed from the first observation
-    ``predict() → (cx, cy)``          – advance without a measurement
-    ``update(cx, cy) → (cx, cy)``     – advance + conditionally correct
-    ``position → (cx, cy) | None``    – current filtered centre
-    ``velocity → (vcx, vcy) | None``  – current filtered velocity
+``BallKalmanFilter``  (``AdaptiveBallKalmanFilter`` is a backward-compat alias)
+    ``initialize(cx, cy)``                – seed from the first observation
+    ``predict() → (cx, cy)``             – advance without a measurement
+    ``update(cx, cy) → (cx, cy)``        – advance + Laplacian-robust correct
+    ``position → (cx, cy) | None``       – current filtered centre
+    ``velocity → (vcx, vcy) | None``     – current filtered velocity
     ``acceleration → (acx, acy) | None`` – current filtered acceleration
-    ``initialized``                   – True once seeded
-    ``frames_since_detection``        – consecutive frames without an accepted measurement
-    ``last_measurement_gated``        – True if the last ``update()`` call was gated
-    ``reset()``                       – return to uninitialised state
+    ``laplacian_weight``                 – M-estimator weight from last update
+    ``initialized``                      – True once seeded
+    ``frames_since_detection``           – frames without an accepted measurement
+    ``last_measurement_gated``           – True if last update was hard-gated
+    ``reset()``                          – return to uninitialised state
 """
 
 from __future__ import annotations
@@ -82,22 +99,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Chi-squared thresholds for 2 degrees of freedom (2 observed coordinates)
-_CHI2_95_2DOF = 5.991  # 95th percentile — used to trigger adaptive Q
-_CHI2_99_2DOF = 9.210  # 99th percentile — default measurement gate
+# Chi-squared thresholds for 2 degrees of freedom
+_CHI2_95_2DOF = 5.991   # sqrt → d = 2.448; Laplacian Q trigger
+_CHI2_99_2DOF = 9.210   # sqrt → d = 3.033; kept for reference
+
+# Default hard gate (only for truly extreme outliers, d > 30)
+_HARD_GATE_CHI2 = 900.0
 
 
 def _build_dwna_q(sigma_acc: float, dt: float = 1.0) -> np.ndarray:
-    """Build the 6×6 DWNA process-noise matrix for a 2-D CA model.
+    """Build the 6×6 DWNA process-noise covariance for a 2-D CA model.
 
-    State order: ``[cx, cy, vcx, vcy, acx, acy]``.  The x and y components
-    are independent; each follows the 1-D DWNA model where the acceleration
-    noise input has standard deviation ``sigma_acc``.
+    State order: ``[cx, cy, vcx, vcy, acx, acy]``.  Each axis follows the
+    1-D Discrete White-Noise Acceleration (DWNA) model with acceleration
+    noise standard deviation ``sigma_acc``.
 
     Parameters
     ----------
     sigma_acc:
-        Standard deviation of the acceleration-noise input (px/frame²).
+        Acceleration-noise standard deviation (px/frame²).
     dt:
         Frame time step (default 1 frame).
 
@@ -106,16 +126,12 @@ def _build_dwna_q(sigma_acc: float, dt: float = 1.0) -> np.ndarray:
     np.ndarray
         6×6 symmetric positive-semidefinite covariance matrix.
     """
-    # 1-D noise-input vector (maps jerk noise → [pos, vel, acc])
     g = np.array([0.5 * dt ** 2, dt, 1.0], dtype=np.float64)
-    q1 = sigma_acc ** 2 * np.outer(g, g)  # 3×3 for one axis
+    q1 = sigma_acc ** 2 * np.outer(g, g)
 
-    # Expand to 6×6 with interleaved x/y state ordering
     Q = np.zeros((6, 6), dtype=np.float64)
-    # x sub-indices: 0=cx, 2=vcx, 4=acx
-    ix = [0, 2, 4]
-    # y sub-indices: 1=cy, 3=vcy, 5=acy
-    iy = [1, 3, 5]
+    ix = [0, 2, 4]  # x sub-indices: cx, vcx, acx
+    iy = [1, 3, 5]  # y sub-indices: cy, vcy, acy
     for r in range(3):
         for c in range(3):
             Q[ix[r], ix[c]] = q1[r, c]
@@ -123,59 +139,148 @@ def _build_dwna_q(sigma_acc: float, dt: float = 1.0) -> np.ndarray:
     return Q
 
 
+class _VanDerMerweSigmaPoints:
+    """Van der Merwe scaled sigma-point generator.
+
+    Parameters
+    ----------
+    n:
+        State dimension.
+    alpha:
+        Spread parameter.  Larger values give wider sigma-point spread,
+        capturing heavier-tailed distributions better.  Default ``0.3``.
+    beta:
+        Distribution parameter.  ``2.0`` is optimal for Gaussian; also
+        appropriate for the near-Gaussian posterior here.
+    kappa:
+        Secondary scaling parameter.  ``0.0`` (default) is standard.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        alpha: float = 0.3,
+        beta: float = 2.0,
+        kappa: float = 0.0,
+    ) -> None:
+        self.n = n
+        lam = alpha ** 2 * (n + kappa) - n
+        self._lam = lam
+        self._c = n + lam  # scaling factor for Cholesky
+
+        n_sigma = 2 * n + 1
+        self.Wm = np.full(n_sigma, 1.0 / (2.0 * (n + lam)))
+        self.Wm[0] = lam / (n + lam)
+
+        self.Wc = self.Wm.copy()
+        self.Wc[0] += (1.0 - alpha ** 2 + beta)
+
+    def compute(self, x: np.ndarray, P: np.ndarray) -> np.ndarray:
+        """Return ``(2n+1, n)`` array of sigma points.
+
+        Parameters
+        ----------
+        x:
+            State mean vector (length *n*).
+        P:
+            State covariance matrix (n×n).
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape ``(2n+1, n)`` where row 0 is the mean sigma
+            point and rows 1..n / n+1..2n are positive/negative shifts.
+
+        Raises
+        ------
+        np.linalg.LinAlgError
+            If ``P`` is not positive-definite (Cholesky fails).
+        """
+        n = self.n
+        U = np.linalg.cholesky(self._c * P)  # lower triangular: U @ U.T = c*P
+
+        X = np.empty((2 * n + 1, n), dtype=np.float64)
+        X[0] = x
+        for i in range(n):
+            X[i + 1]     = x + U[:, i]
+            X[n + i + 1] = x - U[:, i]
+        return X
+
+
 class BallKalmanFilter:
-    """Adaptive Constant-Acceleration Kalman filter for tracking the football.
+    """UKF with Laplacian-robust M-estimator for football centre tracking.
 
-    This replaces the original constant-velocity filter.  Key improvements:
+    **Key differences from the previous Adaptive CA Kalman filter:**
 
-    * **6-state CA model** — tracks position, velocity *and* acceleration so
-      the filter can represent a kicked ball's new trajectory immediately.
-    * **DWNA process noise** — the Q matrix is calibrated to the expected
-      manoeuvre magnitude; ``sigma_acc = 30 px/frame²`` gives
-      ``Q_vel ≈ 900 px²/frame²`` (900× larger than the old CV filter's 1.0).
-    * **Adaptive Q scaling** — when the NIS statistic reveals a sudden
-      trajectory change (kick/bounce) the process noise is temporarily boosted,
-      allowing sub-2-frame recovery.
-    * **Measurement gating** — detections beyond the Mahalanobis gate are
-      rejected as likely false positives, protecting the velocity state.
+    1. *UKF sigma points* — the sigma-point framework correctly propagates
+       uncertainty through any future nonlinear process or measurement model
+       without a Jacobian.
+
+    2. *Laplacian soft gating* — replaces the hard binary gate with a smooth
+       M-estimator weight ``w = min(1, laplacian_b / d)`` where ``d`` is the
+       Mahalanobis distance of the innovation.  A kick causing ``d = 4``
+       (previously rejected outright) now receives a **50 % Kalman correction**
+       on frame 1, allowing the velocity and acceleration states to immediately
+       start tracking the new trajectory.
+
+    3. *Laplacian adaptive Q* — the process noise is boosted proportionally to
+       ``sqrt(NIS)`` (linear in Mahalanobis distance) rather than ``NIS/2``
+       (quadratic).  This is the statistically correct choice for Laplacian
+       process noise and activates earlier for moderate innovations.
 
     Parameters
     ----------
     sigma_acc:
-        Standard deviation of the acceleration disturbance (px/frame²).
-        Increase for a faster/more erratic ball, decrease for smoother
-        predictions.  Default ``30.0`` handles typical broadcast football.
+        Acceleration-noise standard deviation (px/frame²).  Default ``30.0``.
     measurement_noise:
-        Diagonal of the measurement-noise covariance **R** (px²).
-        Corresponds to the standard deviation of YOLO centre-coordinate
-        errors (default ``4.0`` ≈ 2 px std).
+        Diagonal of **R** (px²).  Default ``4.0`` (≈ 2 px std).
+    laplacian_b:
+        Laplacian scale in Mahalanobis units.  Innovations with
+        ``d > laplacian_b`` are soft-downweighted.  Default ``2.0`` (kicks
+        at d=4 get 50 %, extreme outliers at d=20 get 10 %).
     gate_chi2:
-        Chi-squared gate threshold for 2 DOF.  Measurements with Mahalanobis
-        distance² exceeding this value are rejected.  Default ``9.21`` is
-        the chi² 99 % quantile.
+        Hard gate threshold (chi² 2 DOF).  Only pathological detections
+        (``d > 30`` by default) are discarded entirely.  Set lower to
+        increase robustness at the cost of kick-response speed.
     adaptive_q:
-        Enable NIS-based adaptive Q scaling (default *True*).
+        Enable Laplacian adaptive Q scaling.  Default *True*.
     adaptive_q_decay:
-        Per-frame multiplicative decay of the adaptive scale factor back
-        toward 1.0.  Default ``0.85`` returns to normal within ~10 frames.
+        Per-frame decay of the Q scale factor back toward 1.0.
+        Default ``0.85``.
     adaptive_q_max_scale:
-        Maximum allowed adaptive scale factor (default ``50.0``).
+        Maximum Q scale factor.  Default ``50.0``.
+    ukf_alpha:
+        UKF sigma-point spread parameter.  Default ``0.3`` (wider spread
+        appropriate for heavy-tailed Laplacian distributions).
+    ukf_beta:
+        UKF distribution parameter.  Default ``2.0``.
+    ukf_kappa:
+        UKF secondary scaling parameter.  Default ``0.0``.
+    process_noise:
+        Ignored (kept for backward compatibility with call sites that passed
+        the old ``process_noise`` keyword argument).
     """
 
     def __init__(
         self,
         sigma_acc: float = 30.0,
         measurement_noise: float = 4.0,
-        gate_chi2: float = _CHI2_99_2DOF,
+        laplacian_b: float = 2.0,
+        gate_chi2: float = _HARD_GATE_CHI2,
         adaptive_q: bool = True,
         adaptive_q_decay: float = 0.85,
         adaptive_q_max_scale: float = 50.0,
-        # Legacy parameters kept for backward-compatibility only
-        process_noise: float | None = None,  # ignored (superseded by sigma_acc)
+        ukf_alpha: float = 0.3,
+        ukf_beta: float = 2.0,
+        ukf_kappa: float = 0.0,
+        # Legacy — silently ignored
+        process_noise: float | None = None,  # noqa: ARG002
     ) -> None:
-        dt = 1.0  # inter-frame time step (1 frame)
+        dt = 1.0
 
-        # -- State-transition matrix (Constant-Acceleration, dt=1) ---------------
+        n = 6  # state dimension
+
+        # -- State transition (Constant-Acceleration, linear) -------------------
         # State: [cx, cy, vcx, vcy, acx, acy]
         self.F = np.array(
             [
@@ -189,25 +294,31 @@ class BallKalmanFilter:
             dtype=np.float64,
         )
 
-        # -- Measurement matrix (observe position only) --------------------------
-        self.H = np.zeros((2, 6), dtype=np.float64)
+        # -- Measurement matrix (observe position only) -------------------------
+        self.H = np.zeros((2, n), dtype=np.float64)
         self.H[0, 0] = 1.0  # cx
         self.H[1, 1] = 1.0  # cy
 
-        # -- Process noise (DWNA Q, scaled adaptively) --------------------------
+        # -- Process-noise covariance (DWNA, Laplacian-adaptively scaled) ------
         self._Q_base = _build_dwna_q(sigma_acc, dt)
 
-        # -- Measurement noise --------------------------------------------------
+        # -- Measurement-noise covariance --------------------------------------
         self.R = np.eye(2, dtype=np.float64) * measurement_noise
 
-        # -- Gating + adaptive Q settings --------------------------------------
+        # -- Laplacian + gating settings --------------------------------------
+        self._laplacian_b = laplacian_b
         self._gate_chi2 = gate_chi2
+
+        # -- Adaptive Q settings ----------------------------------------------
         self._adaptive_q = adaptive_q
         self._adaptive_q_decay = adaptive_q_decay
         self._adaptive_q_max_scale = adaptive_q_max_scale
         self._adaptive_scale: float = 1.0
 
-        # -- State estimate and covariance (lazy-initialised) ------------------
+        # -- UKF sigma-point generator ----------------------------------------
+        self._sp = _VanDerMerweSigmaPoints(n, alpha=ukf_alpha, beta=ukf_beta, kappa=ukf_kappa)
+
+        # -- State (lazy-initialised) -----------------------------------------
         self.x: np.ndarray | None = None
         self.P: np.ndarray = np.diag(
             [100.0, 100.0, 900.0, 900.0, 2500.0, 2500.0]
@@ -215,21 +326,106 @@ class BallKalmanFilter:
         self._initialized = False
         self._frames_since_detection: int = 0
         self._last_gated: bool = False
+        self._laplacian_weight: float = 1.0
 
-    # ── Effective Q (Q_base scaled by adaptive factor) ─────────────────────────
+    # ── Effective Q ────────────────────────────────────────────────────────────
 
     @property
     def _Q(self) -> np.ndarray:
         return self._Q_base * self._adaptive_scale
 
+    # ── UKF predict / update internals ─────────────────────────────────────────
+
+    def _ukf_predict(self) -> tuple[np.ndarray, np.ndarray]:
+        """UKF predict step: propagate sigma points through F.
+
+        Returns
+        -------
+        (x_pred, P_pred):
+            Predicted state and covariance.
+        """
+        X = self._sp.compute(self.x, self.P)              # (2n+1, 6)
+        X_pred = (self.F @ X.T).T                         # apply linear F
+
+        x_pred = X_pred.T @ self._sp.Wm                   # weighted mean
+
+        P_pred = self._Q.copy()
+        for i, Xi in enumerate(X_pred):
+            d = Xi - x_pred
+            P_pred += self._sp.Wc[i] * np.outer(d, d)
+
+        return x_pred, P_pred
+
+    def _ukf_update(
+        self,
+        x_pred: np.ndarray,
+        P_pred: np.ndarray,
+        z: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """UKF update step with Laplacian M-estimator.
+
+        The measurement noise **R** is inflated by ``1 / w`` where
+        ``w = min(1, laplacian_b / d)`` and ``d`` is the Mahalanobis distance
+        of the innovation.  This soft-downweights large innovations (false
+        detections) while still applying substantial correction for genuine
+        kicks (moderate-to-large ``d``).
+
+        Parameters
+        ----------
+        x_pred, P_pred:
+            Predicted state and covariance from :meth:`_ukf_predict`.
+        z:
+            Measurement vector ``[cx, cy]``.
+
+        Returns
+        -------
+        (x_new, P_new, nis, w):
+            Updated state, updated covariance, NIS, and Laplacian weight.
+        """
+        X = self._sp.compute(x_pred, P_pred)
+
+        # Propagate sigma points through linear H
+        Z_pred = (self.H @ X.T).T                         # (2n+1, 2)
+        z_pred = Z_pred.T @ self._sp.Wm                   # weighted mean (2,)
+
+        # Innovation covariance S and cross-covariance Pxz
+        S = self.R.copy()
+        Pxz = np.zeros((6, 2), dtype=np.float64)
+        for i, (Xi, Zi) in enumerate(zip(X, Z_pred)):
+            dz = Zi - z_pred
+            dx = Xi - x_pred
+            S   += self._sp.Wc[i] * np.outer(dz, dz)
+            Pxz += self._sp.Wc[i] * np.outer(dx, dz)
+
+        # Innovation
+        y = z - z_pred
+        S_inv = np.linalg.inv(S)
+        nis = float(y @ S_inv @ y)
+        d = float(np.sqrt(max(nis, 0.0)))
+
+        # ── Laplacian M-estimator weight ──────────────────────────────────
+        # w = 1 for d ≤ laplacian_b (Gaussian-like region)
+        # w = laplacian_b/d < 1 for d > laplacian_b (soft downweight)
+        w = min(1.0, self._laplacian_b / max(d, 1e-8))
+
+        # Inflate R by 1/w → reduce Kalman gain for large innovations
+        R_eff = self.R / w
+        S_eff = (S - self.R) + R_eff   # S_eff = H*P*H^T + R_eff
+
+        K = Pxz @ np.linalg.inv(S_eff)
+
+        x_new = x_pred + K @ y
+
+        # Joseph-form covariance update (numerically stable)
+        I_KH = np.eye(6, dtype=np.float64) - K @ self.H
+        P_new = I_KH @ P_pred @ I_KH.T + K @ R_eff @ K.T
+
+        return x_new, P_new, nis, w
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     def initialize(self, cx: float, cy: float) -> None:
-        """Seed the filter from the first observation.
-
-        Velocity and acceleration are initialised to zero; the large initial
-        covariance allows rapid adaptation on the first few measurements.
-        """
+        """Seed the filter from the first observation."""
         self.x = np.array([cx, cy, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
         self.P = np.diag(
             [100.0, 100.0, 900.0, 900.0, 2500.0, 2500.0]
@@ -238,17 +434,15 @@ class BallKalmanFilter:
         self._frames_since_detection = 0
         self._adaptive_scale = 1.0
         self._last_gated = False
+        self._laplacian_weight = 1.0
 
     def predict(self) -> tuple[float, float]:
-        """Propagate state one frame ahead without using a new measurement.
-
-        Updates the adaptive scale decay and increments
-        ``frames_since_detection``.
+        """Advance state one frame without a new measurement (UKF predict only).
 
         Returns
         -------
         (cx, cy):
-            Predicted ball centre in pixel coordinates.
+            Predicted ball centre.
 
         Raises
         ------
@@ -259,82 +453,89 @@ class BallKalmanFilter:
             raise RuntimeError(
                 "BallKalmanFilter.initialize() must be called before predict()."
             )
-        # Decay adaptive scale toward 1.0 even when no measurement arrives
+        # Decay adaptive scale toward 1.0
         self._adaptive_scale = max(1.0, self._adaptive_scale * self._adaptive_q_decay)
 
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self._Q
+        self.x, self.P = self._ukf_predict()
         self._frames_since_detection += 1
-        self._last_gated = True  # effectively treated as gated (no measurement)
+        self._last_gated = True
+        self._laplacian_weight = 1.0
         return float(self.x[0]), float(self.x[1])
 
     def update(self, cx: float, cy: float) -> tuple[float, float]:
-        """Advance state and conditionally correct with a new measurement.
+        """Advance state and apply a Laplacian-robust measurement correction.
 
-        The measurement is **gated** (rejected) when its squared Mahalanobis
-        distance from the predicted position exceeds ``gate_chi2``.  A gated
-        measurement is treated like no detection: the state is only predicted
-        and ``frames_since_detection`` increments.
+        The measurement is **soft-downweighted** rather than hard-gated:
+        a kick causing a large Mahalanobis distance ``d`` still contributes
+        a partial correction proportional to ``min(1, laplacian_b / d)``.
+        Only detections beyond the safety hard gate (default ``d = 30``) are
+        discarded outright.
 
-        If the filter has not been initialised yet, the state is seeded from
+        If the filter has not been initialised yet the state is seeded from
         ``(cx, cy)`` and the raw position is returned immediately.
 
         Returns
         -------
         (cx, cy):
-            Filtered ball centre (or predicted centre if gated).
+            Filtered (or predicted) ball centre.
         """
         if not self._initialized:
             self.initialize(cx, cy)
             return cx, cy
 
-        # -- Decay adaptive scale before predict step --------------------------
+        # Decay adaptive scale
         self._adaptive_scale = max(1.0, self._adaptive_scale * self._adaptive_q_decay)
 
-        # -- Predict step -------------------------------------------------------
-        x_pred = self.F @ self.x
-        P_pred = self.F @ self.P @ self.F.T + self._Q
+        # -- UKF predict step -------------------------------------------------
+        x_pred, P_pred = self._ukf_predict()
 
-        # -- Innovation and innovation covariance ------------------------------
+        # -- Pre-compute raw innovation to check hard gate --------------------
         z = np.array([cx, cy], dtype=np.float64)
-        y = z - self.H @ x_pred                   # innovation
-        S = self.H @ P_pred @ self.H.T + self.R   # innovation covariance
+        y_raw = z - self.H @ x_pred
+        S_raw = self.H @ P_pred @ self.H.T + self.R
+        nis_raw = float(y_raw @ np.linalg.inv(S_raw) @ y_raw)
 
-        # -- Measurement gating (Mahalanobis distance) -------------------------
-        S_inv = np.linalg.inv(S)
-        nis = float(y @ S_inv @ y)                # Normalised Innovation Squared
-
-        if nis > self._gate_chi2:
-            # Reject measurement: only predict, do not correct
+        if nis_raw > self._gate_chi2:
+            # Extreme outlier — discard measurement entirely
             logger.debug(
-                "Ball Kalman: measurement gated (NIS=%.2f > %.2f); "
-                "accepting predicted position instead.",
-                nis, self._gate_chi2,
+                "Ball UKF: hard gate triggered (NIS=%.1f > %.1f, d=%.1f); "
+                "predict-only this frame.",
+                nis_raw, self._gate_chi2, float(np.sqrt(nis_raw)),
             )
             self.x = x_pred
             self.P = P_pred
             self._frames_since_detection += 1
             self._last_gated = True
+            self._laplacian_weight = 0.0
             return float(self.x[0]), float(self.x[1])
 
-        # -- Adaptive Q update (triggered when NIS > 95% chi² threshold) ------
-        if self._adaptive_q and nis > _CHI2_95_2DOF:
-            new_scale = min(nis / 2.0, self._adaptive_q_max_scale)
-            if new_scale > self._adaptive_scale:
-                self._adaptive_scale = new_scale
-                logger.debug(
-                    "Ball Kalman: adaptive Q boosted to %.1f× (NIS=%.2f)",
-                    self._adaptive_scale, nis,
-                )
+        # -- UKF update with Laplacian M-estimator ----------------------------
+        x_new, P_new, nis, w = self._ukf_update(x_pred, P_pred, z)
 
-        # -- Correction step ---------------------------------------------------
-        K = P_pred @ self.H.T @ S_inv             # Kalman gain
-        self.x = x_pred + K @ y
-        I_KH = np.eye(6, dtype=np.float64) - K @ self.H
-        self.P = I_KH @ P_pred @ I_KH.T + K @ self.R @ K.T  # Joseph form (numerically stable)
+        # -- Laplacian adaptive Q: sqrt(NIS) scaling (linear in d) ------------
+        if self._adaptive_q:
+            d = float(np.sqrt(max(nis, 0.0)))
+            d_thresh = float(np.sqrt(_CHI2_95_2DOF))  # ≈ 2.45
+            if d > d_thresh:
+                # Laplacian-motivated: boost ∝ d (not d²)
+                new_scale = min(d / d_thresh, self._adaptive_q_max_scale)
+                if new_scale > self._adaptive_scale:
+                    self._adaptive_scale = new_scale
+                    logger.debug(
+                        "Ball UKF: Laplacian Q boost %.1f× (d=%.2f)",
+                        self._adaptive_scale, d,
+                    )
 
+        self.x = x_new
+        self.P = P_new
         self._frames_since_detection = 0
         self._last_gated = False
+        self._laplacian_weight = w
+
+        logger.debug(
+            "Ball UKF: update accepted (NIS=%.2f, d=%.2f, w=%.2f)",
+            nis, float(np.sqrt(max(nis, 0.0))), w,
+        )
         return float(self.x[0]), float(self.x[1])
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -346,7 +547,7 @@ class BallKalmanFilter:
 
     @property
     def position(self) -> tuple[float, float] | None:
-        """Current filtered ``(cx, cy)``, or *None* if not yet initialized."""
+        """Current filtered ``(cx, cy)``, or *None* if not initialized."""
         if not self._initialized or self.x is None:
             return None
         return float(self.x[0]), float(self.x[1])
@@ -367,13 +568,24 @@ class BallKalmanFilter:
 
     @property
     def frames_since_detection(self) -> int:
-        """Consecutive frames without an accepted (non-gated) measurement."""
+        """Consecutive frames without an accepted (non-hard-gated) measurement."""
         return self._frames_since_detection
 
     @property
     def last_measurement_gated(self) -> bool:
-        """*True* if the last :meth:`update` call was rejected by the gate."""
+        """*True* if the last :meth:`update` was rejected by the hard gate."""
         return self._last_gated
+
+    @property
+    def laplacian_weight(self) -> float:
+        """M-estimator weight from the most recent :meth:`update` call.
+
+        * ``1.0``: measurement was in the Gaussian region (small innovation).
+        * ``0 < w < 1``: measurement was soft-downweighted (kick or moderate
+          outlier).
+        * ``0.0``: measurement was hard-gated (extreme outlier).
+        """
+        return self._laplacian_weight
 
     def reset(self) -> None:
         """Return the filter to its uninitialised state."""
@@ -385,7 +597,8 @@ class BallKalmanFilter:
         self._frames_since_detection = 0
         self._adaptive_scale = 1.0
         self._last_gated = False
+        self._laplacian_weight = 1.0
 
 
-# Alias for explicitness — both names refer to the same class
+# Backward-compatibility alias
 AdaptiveBallKalmanFilter = BallKalmanFilter

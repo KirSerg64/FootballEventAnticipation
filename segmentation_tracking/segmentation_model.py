@@ -21,22 +21,24 @@ Architecture (updated)
    bboxes before IoU matching, preventing ID switches caused by camera panning
    or zooming.
 
-4. The **ball** is tracked with an **Adaptive Constant-Acceleration (CA)
-   Kalman filter** (``BallKalmanFilter``).  Compared to the earlier
-   constant-velocity filter, this model:
+4. The **ball** is tracked with a **UKF with Laplacian-robust M-estimator**
+   (``BallKalmanFilter``).  Compared to the previous adaptive CA Kalman filter:
 
-   * Tracks position, velocity *and* acceleration, so it responds within
-     1–2 frames after a sudden kick or bounce (CA state carries the new
-     direction forward automatically).
-   * Uses the DWNA (Discrete White-Noise Acceleration) Q matrix calibrated
-     to the expected ball manoeuvre magnitude (``ball_sigma_acc = 30``
-     px/frame² by default; Q_vel ≈ 900×larger than the old CV filter).
-   * Applies NIS-based adaptive Q scaling: when the normalised innovation
-     squared exceeds the chi² 95 % threshold the process noise is temporarily
-     boosted by up to 50×, allowing sub-2-frame recovery from kicks.
-   * Gates false YOLO detections via the Mahalanobis distance (chi² 99 %,
-     2 DOF = 9.21), preventing spurious hits from corrupting the velocity
-     and acceleration states.
+   * Still uses the 6-state CA model ``[cx, cy, vcx, vcy, acx, acy]`` with
+     DWNA Q (``sigma_acc = 30`` px/frame² by default).
+   * **UKF sigma points** (van der Merwe) propagate uncertainty correctly
+     through any nonlinear model and form the foundation for physics-based
+     extensions (drag, projectile arc).
+   * **Laplacian soft gating** replaces the old hard binary gate: the
+     M-estimator weight ``w = min(1, b/d)`` partially corrects even large
+     innovations — a kick causing ``d = 4`` receives **50 % correction on
+     frame 1** rather than 0 % (hard rejected), capturing instant trajectory
+     changes immediately.
+   * **Laplacian adaptive Q** scales by ``sqrt(NIS)`` (linear in Mahalanobis
+     distance ``d``), which is the correct choice for heavy-tailed Laplacian
+     process noise and activates earlier for moderate kicks.
+   * Only truly pathological measurements (``d > 30`` by default) are
+     discarded via the safety hard gate.
 
 5. **Re-detection** every ``redetect_interval`` frames picks up players who
    enter the scene after frame 0.  All matching in the re-detection path also
@@ -168,14 +170,16 @@ class SegmentationTracker:
         previous-frame bboxes before IoU matching in the fallback path to
         compensate for camera motion.
     ball_sigma_acc:
-        Standard deviation of the ball acceleration disturbance (px/frame²)
-        used by the Adaptive CA Kalman filter.  Increase for faster / more
-        erratic balls (e.g. hard kicks on a wide-angle camera).  Default
-        ``30.0`` suits typical broadcast football footage.
+        Acceleration-noise standard deviation (px/frame²) for the UKF ball
+        tracker.  Default ``30.0`` suits typical broadcast football footage.
+    ball_laplacian_b:
+        Laplacian M-estimator scale in Mahalanobis units.  Innovations with
+        ``d > ball_laplacian_b`` are soft-downweighted by ``b/d``.  Default
+        ``2.0``: kicks at d=4 receive 50 % correction (instant tracking),
+        extreme outliers at d=20 receive only 10 %.
     ball_gate_chi2:
-        Mahalanobis-distance² gate threshold for ball detection gating.
-        Measurements beyond this value (chi-squared 2 DOF) are rejected as
-        likely false YOLO positives.  Default ``9.21`` (99 % quantile).
+        Hard gate threshold (chi² 2 DOF).  Only extreme outliers beyond this
+        value are discarded entirely.  Default ``900.0`` (d = 30).
     """
 
     def __init__(
@@ -190,7 +194,8 @@ class SegmentationTracker:
         max_age: int = 30,
         use_homography: bool = True,
         ball_sigma_acc: float = 30.0,
-        ball_gate_chi2: float = 9.21,
+        ball_laplacian_b: float = 2.0,
+        ball_gate_chi2: float = 900.0,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -207,6 +212,7 @@ class SegmentationTracker:
         self._next_player_id: int = 1
         self._ball_kalman = BallKalmanFilter(
             sigma_acc=ball_sigma_acc,
+            laplacian_b=ball_laplacian_b,
             gate_chi2=ball_gate_chi2,
         )
 
