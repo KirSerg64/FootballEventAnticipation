@@ -53,6 +53,8 @@ Optional flags::
     --ball_psr_threshold 7.0             Ball DCF MOSSE PSR acceptance threshold
     --ball_conf          0.10            Ball YOLO confidence threshold (stage-1, lower than player conf)
     --ball_conf_roi      0.05            Ball YOLO confidence for ROI re-detection (stage-2, FRoG-MOT)
+    --ball_tracker       dcf              Ball tracker backend: dcf|cotracker
+    --ball_ct_redetect   15               CoTracker ball: YOLO re-anchor interval (frames)
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -397,6 +399,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ball_tracker", default="dcf",
+        choices=["dcf", "cotracker"],
+        help=(
+            "Ball tracker backend (default: dcf).  "
+            "'dcf' uses the MOSSE correlation-filter tracker (BallDCFTracker). "
+            "'cotracker' uses CoTracker3 point tracking (BallCoTrackerTracker): "
+            "takes the first YOLO detection as the initial anchor point and "
+            "propagates the ball with CoTracker3 between detections, "
+            "re-anchoring to YOLO every --ball_ct_redetect frames.  "
+            "Reuses --cotracker_model, --cotracker_checkpoint, and --device."
+        ),
+    )
+    parser.add_argument(
+        "--ball_ct_redetect", type=int, default=15,
+        help=(
+            "CoTracker ball tracker: number of YOLO-confirmed detections "
+            "between forced re-anchors (default: 15).  After this many "
+            "confirmed YOLO hits the CoTracker3 query point is reset to the "
+            "current YOLO position so the tracker stays locked after kicks. "
+            "Only used when --ball_tracker cotracker."
+        ),
+    )
+    parser.add_argument(
         "--codec", default="mp4v",
         help=(
             "FourCC video codec for the output file (default: mp4v). "
@@ -545,6 +570,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ball_psr_threshold=args.ball_psr_threshold,
         ball_conf_threshold=args.ball_conf,
         ball_conf_roi=args.ball_conf_roi,
+        ball_tracker_type=args.ball_tracker,
+        ball_cotracker_model=args.cotracker_model,
+        ball_cotracker_checkpoint=args.cotracker_checkpoint,
+        ball_cotracker_device=args.device,
+        ball_cotracker_redetect_interval=args.ball_ct_redetect,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))

@@ -67,7 +67,7 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from segmentation_tracking.ball_kalman import BallDCFTracker, BallKalmanFilter
+from segmentation_tracking.ball_kalman import BallDCFTracker, BallKalmanFilter, BallCoTrackerTracker
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +207,25 @@ class SegmentationTracker:
         pass (FRoG-MOT stage-2).  Default ``0.05``.  After restricting the
         search to the predicted ball region, false positives are rare even
         at this very low threshold.
+    ball_tracker_type:
+        Ball tracker implementation to use.  ``"dcf"`` (default) uses the
+        MOSSE correlation-filter tracker (:class:`BallDCFTracker`).
+        ``"cotracker"`` uses CoTracker3 point tracking
+        (:class:`BallCoTrackerTracker`), which propagates the ball between
+        YOLO detections using the same neural tracker as the keypoint flow
+        backend.
+    ball_cotracker_model:
+        CoTracker3 hub model for the ball tracker (only used when
+        *ball_tracker_type* is ``"cotracker"``).  ``"cotracker3_online"``
+        (default) or ``"cotracker3_offline"``.
+    ball_cotracker_checkpoint:
+        Optional local path to a CoTracker3 ``.pth`` checkpoint for the
+        ball tracker.  *None* uses the default pretrained weights.
+    ball_cotracker_device:
+        Torch device for the ball CoTracker3 model.  Defaults to ``"cuda"``.
+    ball_cotracker_redetect_interval:
+        Number of YOLO-confirmed ball detections between forced CoTracker3
+        re-anchors.  Default ``15``.
     """
 
     def __init__(
@@ -225,6 +244,11 @@ class SegmentationTracker:
         ball_psr_threshold: float = 7.0,
         ball_conf_threshold: float = 0.10,
         ball_conf_roi: float = 0.05,
+        ball_tracker_type: str = "dcf",
+        ball_cotracker_model: str = "cotracker3_online",
+        ball_cotracker_checkpoint: str | None = None,
+        ball_cotracker_device: str = "cuda",
+        ball_cotracker_redetect_interval: int = 15,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -241,11 +265,21 @@ class SegmentationTracker:
         self._detector = None                # lazy-loaded YOLO model
         self._sam = None                     # lazy-loaded SAM2VideoPredictor
         self._next_player_id: int = 1
-        self._ball_tracker = BallDCFTracker(
-            patch_size=ball_patch_size,
-            search_radius=ball_search_radius,
-            psr_threshold=ball_psr_threshold,
-        )
+
+        _btt = ball_tracker_type.lower()
+        if _btt == "cotracker":
+            self._ball_tracker: BallDCFTracker | BallCoTrackerTracker = BallCoTrackerTracker(
+                redetect_interval=ball_cotracker_redetect_interval,
+                hub_model=ball_cotracker_model,
+                checkpoint=ball_cotracker_checkpoint,
+                device=ball_cotracker_device,
+            )
+        else:
+            self._ball_tracker = BallDCFTracker(
+                patch_size=ball_patch_size,
+                search_radius=ball_search_radius,
+                psr_threshold=ball_psr_threshold,
+            )
 
         # Path to customised tracker YAML written at init time
         self._tracker_config_path: str | None = None

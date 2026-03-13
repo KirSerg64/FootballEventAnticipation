@@ -43,11 +43,12 @@ _BALL_MASK_ALPHA = 0.50
 
 # Ball detection source colours (BGR) — used in debug mode
 _BALL_SOURCE_COLORS: dict[str, tuple[int, int, int]] = {
-    "detected":  (0, 220, 0),    # bright green  – confirmed YOLO detection
-    "roi":       (0, 200, 100),  # yellow-green   – ROI YOLO re-detection (FRoG-MOT)
-    "mosse":     (0, 165, 255),  # orange         – MOSSE correlation gap-fill
-    "predicted": (0, 0, 220),    # red            – velocity extrapolation only
-    "none":      (200, 200, 200),# grey           – fallback (should not appear)
+    "detected":   (0, 220, 0),    # bright green  – confirmed YOLO detection
+    "roi":        (0, 200, 100),  # yellow-green   – ROI YOLO re-detection (FRoG-MOT)
+    "mosse":      (0, 165, 255),  # orange         – MOSSE correlation gap-fill
+    "cotracker":  (255, 100, 0),  # blue           – CoTracker3 propagation
+    "predicted":  (0, 0, 220),    # red            – velocity extrapolation only
+    "none":       (200, 200, 200),# grey           – fallback (should not appear)
 }
 
 # Human-readable labels for each source
@@ -55,6 +56,7 @@ _BALL_SOURCE_LABELS: dict[str, str] = {
     "detected":  "DETECT",
     "roi":       "ROI-DET",
     "mosse":     "MOSSE",
+    "cotracker": "CT3",
     "predicted": "PRED",
     "none":      "NONE",
 }
@@ -160,6 +162,7 @@ class Visualizer:
             "detected": 0,
             "roi": 0,
             "mosse": 0,
+            "cotracker": 0,
             "predicted": 0,
             "none": 0,
         }

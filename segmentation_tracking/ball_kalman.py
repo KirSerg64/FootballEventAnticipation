@@ -1320,3 +1320,452 @@ class BallDCFTracker:
         extra = int(spd * gap * 1.5)
         return int(min(self._search_radius + extra, 350))
 
+
+
+# ---------------------------------------------------------------------------
+# BallCoTrackerTracker — CoTracker3-based ball tracker
+# ---------------------------------------------------------------------------
+
+class BallCoTrackerTracker:
+    """Ball tracker that uses CoTracker3 to propagate the ball between YOLO detections.
+
+    Design
+    ~~~~~~
+    1. **First YOLO detection → anchor**.  The ball centre is registered as a
+       CoTracker3 query point.  All subsequent frames feed the model
+       incrementally (online streaming or offline batch).
+
+    2. **YOLO detections → re-anchor**.  Whenever YOLO detects the ball, the
+       detection counter advances; every *redetect_interval* YOLO-confirmed
+       frames the query point is reset to the new YOLO position so CoTracker3
+       stays locked even after a kick or bounce.
+
+    3. **YOLO miss → CoTracker3 propagation**.  When YOLO misses the ball,
+       the current CoTracker3 tracked position is used.  If CoTracker3 is
+       still warming up (fewer than ``2 * step`` frames buffered) the tracker
+       falls back to linear velocity extrapolation.
+
+    The tracker has the same ``update(cx, cy, frame)`` / ``predict(frame)``
+    / ``reset()`` / ``position`` / ``last_source`` interface as
+    :class:`BallDCFTracker` so the two are interchangeable inside
+    :class:`~segmentation_tracking.segmentation_model.SegmentationTracker`.
+
+    Parameters
+    ----------
+    redetect_interval:
+        Number of *YOLO-confirmed* frames between forced re-anchors.
+        After this many YOLO detections the query point is refreshed with
+        the most-recent YOLO position even if the previous anchor is still
+        tracking well.  Default ``15``.
+    hub_model:
+        CoTracker3 hub model identifier.  ``"cotracker3_online"`` (default,
+        streaming sliding-window) or ``"cotracker3_offline"`` (batch
+        inference over frames since last anchor).
+    checkpoint:
+        Optional local path to a ``.pth`` checkpoint.  When *None* the
+        default pretrained weights are downloaded automatically via
+        ``torch.hub``.
+    device:
+        Torch device string.  CUDA availability is checked at runtime;
+        falls back to CPU when CUDA is absent.
+    velocity_history:
+        Number of recent YOLO positions used to estimate the ball velocity
+        for the warm-up extrapolation fallback.  Default ``5``.
+    """
+
+    _HUB_SOURCE = "facebookresearch/co-tracker"
+
+    def __init__(
+        self,
+        redetect_interval: int = 15,
+        hub_model: str = "cotracker3_online",
+        checkpoint: str | None = None,
+        device: str = "cuda",
+        velocity_history: int = 5,
+    ) -> None:
+        if hub_model not in ("cotracker3_online", "cotracker3_offline"):
+            raise ValueError(
+                "hub_model must be 'cotracker3_online' or 'cotracker3_offline'; "
+                f"got {hub_model!r}"
+            )
+        self._redetect_interval = max(1, int(redetect_interval))
+        self._hub_model = hub_model
+        self._checkpoint = checkpoint
+        self._device_str = device
+        self._velocity_history = max(2, int(velocity_history))
+
+        # Lazy-loaded CoTracker3 predictor (loaded on first use)
+        self._predictor = None
+        self._torch_device = None
+        self._step: int = 8           # inferred from model at init
+
+        # Frame buffer for CoTracker3 (list of (3,H,W) float32 tensors)
+        self._frame_buf: list = []
+        self._max_buf: int = 3 * self._step + 1  # online mode only
+        # Query tensor: (1, 1, 3) — single ball point [t, x, y]
+        self._queries = None
+        # Whether the first CoTracker3 call has been made (online mode)
+        self._ct_initialized: bool = False
+        # Pending frames since last inference
+        self._pending: int = 0
+        # Latest CoTracker3 ball position, or None
+        self._ct_position: tuple[float, float] | None = None
+
+        # YOLO detection history for velocity extrapolation fallback
+        self._det_history: deque[tuple[float, float]] = deque(
+            maxlen=self._velocity_history
+        )
+
+        # Number of YOLO detections since last CoTracker re-anchor
+        self._detections_since_anchor: int = 0
+
+        # General state
+        self._last_cx: float | None = None
+        self._last_cy: float | None = None
+        self._initialized: bool = False  # True once first YOLO detection seen
+        self._frames_since_detection: int = 0
+        self._last_source: str = "none"
+
+    # ── Model loading (lazy) ──────────────────────────────────────────────────
+
+    def _ensure_predictor(self) -> bool:
+        """Lazily load the CoTracker3 model.  Returns *True* on success."""
+        if self._predictor is not None:
+            return True
+        try:
+            import torch
+
+            device = torch.device(
+                self._device_str if torch.cuda.is_available() else "cpu"
+            )
+            self._torch_device = device
+
+            if self._checkpoint is not None:
+                pred = torch.hub.load(
+                    self._HUB_SOURCE, self._hub_model,
+                    pretrained=False, trust_repo=True,
+                )
+                state = torch.load(self._checkpoint, map_location="cpu")
+                pred.load_state_dict(state.get("model", state), strict=False)
+            else:
+                pred = torch.hub.load(
+                    self._HUB_SOURCE, self._hub_model, trust_repo=True
+                )
+
+            pred = pred.to(device)
+            pred.eval()
+            self._predictor = pred
+
+            try:
+                self._step = int(pred.step)
+            except AttributeError:
+                self._step = 8
+            self._max_buf = 3 * self._step + 1
+
+            logger.info(
+                "BallCoTrackerTracker: loaded %s on %s", self._hub_model, device
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "BallCoTrackerTracker: CoTracker3 unavailable (%s); "
+                "will use velocity extrapolation only.",
+                exc,
+            )
+            return False
+
+    # ── Frame / query management ──────────────────────────────────────────────
+
+    def _add_frame(self, frame: np.ndarray) -> None:
+        """Convert *frame* (BGR uint8) and append to the internal buffer."""
+        import torch
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        t = torch.from_numpy(rgb).permute(2, 0, 1).float()
+        self._frame_buf.append(t)
+        if self._hub_model == "cotracker3_online":
+            if len(self._frame_buf) > self._max_buf:
+                self._frame_buf = self._frame_buf[-self._max_buf:]
+        self._pending += 1
+
+    def _set_query(self, cx: float, cy: float) -> None:
+        """Register a new query point at (cx, cy) at t=0 of the next window."""
+        import torch
+        self._queries = torch.tensor(
+            [[[0.0, cx, cy]]], dtype=torch.float32,
+            device=self._torch_device,
+        )
+        # Reset CoTracker3 state so the next call is a first-step
+        self._ct_initialized = False
+        self._pending = 0
+        self._ct_position = None
+        if self._hub_model == "cotracker3_offline":
+            self._frame_buf = []
+
+    def _run_cotracker(self) -> bool:
+        """Run inference if enough frames are pending.  Return *True* on success."""
+        import torch
+
+        if self._queries is None or self._predictor is None:
+            return False
+
+        if self._hub_model == "cotracker3_offline":
+            return self._run_offline()
+
+        # Online mode
+        need = self._step * 2 if not self._ct_initialized else self._step
+        if self._pending < need or len(self._frame_buf) < need:
+            return False
+
+        chunk_frames = self._frame_buf[-need:]
+        video = torch.stack(chunk_frames, dim=0).unsqueeze(0).to(self._torch_device)
+
+        with torch.no_grad():
+            pred_tracks, _ = self._predictor(
+                video,
+                is_first_step=not self._ct_initialized,
+                queries=self._queries if not self._ct_initialized else None,
+            )
+
+        # pred_tracks: (1, T, 1, 2) — take last frame, point 0
+        pos = pred_tracks[0, -1, 0].cpu().numpy()
+        self._ct_position = (float(pos[0]), float(pos[1]))
+        self._ct_initialized = True
+        self._pending = 0
+        return True
+
+    def _run_offline(self) -> bool:
+        """Run offline CoTracker3 on the full frame buffer."""
+        import torch
+
+        if len(self._frame_buf) < 2:
+            return False
+
+        queries_t0 = self._queries.clone()
+        queries_t0[0, :, 0] = 0.0  # pin queries to first frame in buffer
+
+        video = torch.stack(self._frame_buf, dim=0).unsqueeze(0).to(
+            self._torch_device
+        )
+        with torch.no_grad():
+            pred_tracks, _ = self._predictor(video, queries=queries_t0)
+
+        pos = pred_tracks[0, -1, 0].cpu().numpy()
+        self._ct_position = (float(pos[0]), float(pos[1]))
+        self._ct_initialized = True
+        self._pending = 0
+        return True
+
+    # ── Velocity extrapolation (warm-up fallback) ─────────────────────────────
+
+    def _estimate_velocity(self) -> tuple[float, float] | None:
+        """Return (vx, vy) from recent detection history, or *None*."""
+        hist = list(self._det_history)
+        if len(hist) < 2:
+            return None
+        xs = [p[0] for p in hist]
+        ys = [p[1] for p in hist]
+        n = len(hist)
+        dxs = [xs[i + 1] - xs[i] for i in range(n - 1)]
+        dys = [ys[i + 1] - ys[i] for i in range(n - 1)]
+        return (float(np.median(dxs)), float(np.median(dys)))
+
+    def _extrapolate(self) -> tuple[float, float]:
+        """Predict ball position one frame forward via velocity extrapolation."""
+        assert self._last_cx is not None and self._last_cy is not None
+        vel = self._estimate_velocity()
+        if vel is None:
+            return float(self._last_cx), float(self._last_cy)
+        return float(self._last_cx) + vel[0], float(self._last_cy) + vel[1]
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def update(
+        self, cx: float, cy: float, frame: np.ndarray | None = None
+    ) -> tuple[float, float]:
+        """Accept a YOLO ball detection and update the CoTracker3 model.
+
+        On the first call the CoTracker3 model is initialised with the YOLO
+        position as the query point.  On subsequent calls the query point is
+        refreshed whenever *redetect_interval* YOLO-confirmed frames have
+        elapsed since the last re-anchor.
+
+        Parameters
+        ----------
+        cx, cy:
+            Ball centre from YOLO (pixel coordinates).
+        frame:
+            Current BGR uint8 video frame for CoTracker3 update.
+
+        Returns
+        -------
+        (cx, cy):
+            YOLO detection passed through unchanged (zero latency).
+        """
+        if not self._ensure_predictor():
+            # CoTracker3 unavailable — behave like a simple detection tracker
+            self._last_cx = cx
+            self._last_cy = cy
+            self._det_history.append((cx, cy))
+            self._initialized = True
+            self._frames_since_detection = 0
+            self._last_source = "detected"
+            return cx, cy
+
+        should_reanchor = (
+            not self._initialized
+            or self._detections_since_anchor >= self._redetect_interval
+        )
+
+        if should_reanchor:
+            # Add current frame to buffer BEFORE calling _set_query (which
+            # clears the offline buffer), so we always have at least one frame.
+            if frame is not None:
+                self._add_frame(frame)
+            self._set_query(cx, cy)
+            self._detections_since_anchor = 0
+            if frame is not None and self._hub_model == "cotracker3_offline":
+                # _set_query() cleared the buffer; re-add this frame as t=0
+                self._add_frame(frame)
+            self._run_cotracker()
+        else:
+            if frame is not None:
+                self._add_frame(frame)
+            self._run_cotracker()
+            self._detections_since_anchor += 1
+
+        # Sync CoTracker3 position to the confirmed YOLO detection
+        self._ct_position = (cx, cy)
+
+        self._last_cx = cx
+        self._last_cy = cy
+        self._det_history.append((cx, cy))
+        self._initialized = True
+        self._frames_since_detection = 0
+        self._last_source = "detected"
+        return cx, cy
+
+    def predict(self, frame: np.ndarray | None = None) -> tuple[float, float]:
+        """Propagate the ball position when YOLO misses.
+
+        Runs CoTracker3 on the new frame and returns its tracked position.
+        Falls back to velocity extrapolation if CoTracker3 has not yet
+        produced output (warm-up phase) or if the model is unavailable.
+
+        Parameters
+        ----------
+        frame:
+            Current BGR uint8 video frame.
+
+        Returns
+        -------
+        (cx, cy):
+            Estimated ball position for this frame.
+        """
+        if not self._initialized or self._last_cx is None:
+            raise RuntimeError(
+                "BallCoTrackerTracker.predict() called before any YOLO detection."
+            )
+
+        self._frames_since_detection += 1
+
+        if frame is not None and self._predictor is not None:
+            self._add_frame(frame)
+            ran = self._run_cotracker()
+            if ran and self._ct_position is not None:
+                cx, cy = self._ct_position
+                self._last_cx = cx
+                self._last_cy = cy
+                self._last_source = "cotracker"
+                return cx, cy
+
+        # Warm-up fallback: velocity extrapolation
+        cx, cy = self._extrapolate()
+        self._last_cx = cx
+        self._last_cy = cy
+        self._last_source = "predicted"
+        return cx, cy
+
+    def reset(self) -> None:
+        """Return the tracker to its uninitialised state."""
+        self._frame_buf = []
+        self._queries = None
+        self._ct_initialized = False
+        self._pending = 0
+        self._ct_position = None
+        self._det_history.clear()
+        self._detections_since_anchor = 0
+        self._last_cx = None
+        self._last_cy = None
+        self._initialized = False
+        self._frames_since_detection = 0
+        self._last_source = "none"
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def initialized(self) -> bool:
+        """*True* once the first YOLO detection has been processed."""
+        return self._initialized
+
+    @property
+    def frames_since_detection(self) -> int:
+        """Consecutive frames without a YOLO detection (0 after every detection)."""
+        return self._frames_since_detection
+
+    @property
+    def last_measurement_gated(self) -> bool:
+        """Always *False* — kept for API compatibility with :class:`BallDCFTracker`."""
+        return False
+
+    @property
+    def laplacian_weight(self) -> float:
+        """Always 1.0 — kept for API compatibility with :class:`BallKalmanFilter`."""
+        return 1.0
+
+    @property
+    def last_source(self) -> str:
+        """Source of the most-recent ball position estimate.
+
+        Possible values:
+
+        * ``"detected"``  — position came directly from a YOLO detection.
+        * ``"cotracker"`` — CoTracker3 propagation (YOLO missed this frame).
+        * ``"predicted"`` — linear velocity extrapolation (warm-up / fallback).
+        * ``"none"``      — tracker not yet initialised.
+        """
+        return self._last_source
+
+    @property
+    def position(self) -> tuple[float, float] | None:
+        """Current ball ``(cx, cy)``, or *None* if not yet initialized."""
+        if not self._initialized or self._last_cx is None:
+            return None
+        return float(self._last_cx), float(self._last_cy)
+
+    @property
+    def velocity(self) -> tuple[float, float] | None:
+        """Velocity estimate ``(vx, vy)`` in px/frame from recent detections."""
+        return self._estimate_velocity()
+
+    @property
+    def predicted_position(self) -> tuple[float, float] | None:
+        """Ball position predicted one frame forward (without advancing state).
+
+        Used by :meth:`SegmentationTracker._process_ball` to centre the ROI
+        for secondary (FRoG-MOT stage-2) low-confidence YOLO detection.
+        Returns *None* if not yet initialized.
+        """
+        if not self._initialized or self._last_cx is None:
+            return None
+        if self._ct_position is not None:
+            return self._ct_position
+        return self._extrapolate()
+
+    @property
+    def adaptive_search_radius(self) -> int:
+        """Search radius for ROI-based re-detection (pixels).
+
+        Returns a fixed modest value since CoTracker3 provides a good
+        position estimate; 80 px covers typical tracking error.
+        """
+        return 80
