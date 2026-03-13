@@ -32,6 +32,12 @@ Optional flags::
     --attractor_mode     velocity         Direction mode: 'velocity' or 'acceleration'
     --attractor_smooth   8.0              Kalman process-noise std (px/frame²); higher = smoother
     --attractor_max_stale 30              Stale frames before attractor marker disappears
+    --attractor_source   bbox             Velocity source: bbox|keypoints|combined
+    --kp_flow_backend    lk               Keypoint flow backend: lk|cotracker
+    --kp_detect_interval 1                Re-detect pose every N frames; flow tracks between
+    --cotracker_checkpoint               Optional CoTracker3 .pth checkpoint path
+    --attractor_dist_sigma 0.0            Gaussian distance-weighting sigma (px); 0=disabled
+    --attractor_directional               Enable directional weighting (toward-anchor cosine)
     --export_json                         Export player_tracks.json + ball_track.json
     --redetect_interval  30               Re-run YOLO every N frames for new players
     --tracker            botsort          Primary tracker: botsort or bytetrack
@@ -68,6 +74,7 @@ from segmentation_tracking import (
     associate_poses_with_tracks,
     TeamClassifier,
     PlayerVelocityTracker,
+    KeypointVelocityTracker,
     estimate_attractor,
     AttractorSmoother,
 )
@@ -216,6 +223,72 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "estimate before the attractor marker disappears (default: 30).  "
             "During the hold period the marker is shown with a dashed outline "
             "and linearly decaying confidence."
+        ),
+    )
+    # Attractor source and keypoint optical-flow settings
+    parser.add_argument(
+        "--attractor_source", default="bbox",
+        choices=["bbox", "keypoints", "combined"],
+        help=(
+            "Velocity source for the attractor estimator when --show_attractor "
+            "is enabled (default: bbox).  "
+            "'bbox' uses bounding-box centre displacement (original method).  "
+            "'keypoints' uses hip/knee keypoint centroids, optionally tracked "
+            "with sparse optical flow between pose detections.  "
+            "'combined' merges both; keypoint velocities take priority."
+        ),
+    )
+    parser.add_argument(
+        "--kp_flow_backend", default="lk",
+        choices=["lk", "cotracker"],
+        help=(
+            "Sparse optical-flow backend used by the keypoint tracker when "
+            "--attractor_source is 'keypoints' or 'combined' and "
+            "--kp_detect_interval > 1 (default: lk).  "
+            "'lk' uses Lucas-Kanade pyramidal flow (fast, CPU, no extra deps).  "
+            "'cotracker' uses CoTracker3 online mode (accurate, GPU, requires "
+            "'pip install cotracker')."
+        ),
+    )
+    parser.add_argument(
+        "--kp_detect_interval", type=int, default=1,
+        help=(
+            "Re-read pose keypoints from the estimator every N frames; "
+            "between re-detections the selected optical-flow backend propagates "
+            "the keypoints for smoother velocity estimates (default: 1, i.e. "
+            "fresh keypoints every frame, flow backend not used).  "
+            "Higher values reduce re-detection noise at the cost of drift."
+        ),
+    )
+    parser.add_argument(
+        "--cotracker_checkpoint", default=None,
+        help=(
+            "Optional local path to a CoTracker3 .pth checkpoint file.  "
+            "If not provided, the default pretrained weights are downloaded "
+            "automatically (requires internet on first run)."
+        ),
+    )
+    # Distance and directional weighting for the attractor
+    parser.add_argument(
+        "--attractor_dist_sigma", type=float, default=0.0,
+        help=(
+            "Gaussian distance-weighting sigma (pixels) for the attractor "
+            "estimator (default: 0.0 = disabled).  When > 0, player rays are "
+            "weighted by exp(-d²/2σ²) where d is the distance from the anchor "
+            "(ball position when detected, otherwise previous attractor).  "
+            "A value of 200 px works well for 1080p broadcast footage."
+        ),
+    )
+    parser.add_argument(
+        "--attractor_directional", action="store_true",
+        help=(
+            "Enable directional weighting for the attractor estimator.  "
+            "Each player's weight is additionally multiplied by "
+            "max(0.05, cos θ) where θ is the angle between the player's "
+            "velocity/acceleration direction and the toward-anchor direction.  "
+            "Players actively moving toward the centre of action contribute "
+            "fully; players running away are strongly down-weighted.  "
+            "Requires an anchor point (ball or previous attractor)."
         ),
     )
     parser.add_argument(
@@ -475,10 +548,24 @@ def run_pipeline(args: argparse.Namespace) -> None:
         show_attractor=args.show_attractor,
     )
 
-    # Vector-field attractor tracker (only allocated when needed)
-    vel_tracker: PlayerVelocityTracker | None = (
+    # ── Vector-field attractor trackers (only allocated when needed) ──────────
+    # bbox-based tracker (always created when attractor is enabled; used in
+    # 'bbox' and 'combined' modes)
+    bbox_vel_tracker: PlayerVelocityTracker | None = (
         PlayerVelocityTracker(history_len=args.attractor_history)
-        if args.show_attractor
+        if args.show_attractor and args.attractor_source in ("bbox", "combined")
+        else None
+    )
+    # keypoint-based tracker (used in 'keypoints' and 'combined' modes)
+    kp_vel_tracker: KeypointVelocityTracker | None = (
+        KeypointVelocityTracker(
+            history_len=args.attractor_history,
+            flow_backend=args.kp_flow_backend,
+            detect_interval=args.kp_detect_interval,
+            device=args.device,
+            cotracker_checkpoint=args.cotracker_checkpoint,
+        )
+        if args.show_attractor and args.attractor_source in ("keypoints", "combined")
         else None
     )
     # Kalman smoother for the attractor position
@@ -490,6 +577,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if args.show_attractor and args.attractor_smooth > 0
         else None
     )
+    # Remember the last smoothed attractor point for distance-weighting anchor
+    _prev_attractor_pt: tuple[float, float] | None = None
 
     # JSON export accumulators
     player_tracks_export: list[dict] = []
@@ -540,18 +629,63 @@ def run_pipeline(args: argparse.Namespace) -> None:
         # -- Vector-field attractor (optional) --------------------------------
         velocities = None
         attractor = None
-        if vel_tracker is not None:
-            velocities = vel_tracker.update(player_tracks)
+        if args.show_attractor:
+            # Collect velocity dicts from active trackers
+            bbox_vels: dict = {}
+            kp_vels: dict = {}
 
-            # Choose direction vectors based on selected mode
+            if bbox_vel_tracker is not None:
+                bbox_vels = bbox_vel_tracker.update(player_tracks)
+
+            if kp_vel_tracker is not None:
+                kp_vels = kp_vel_tracker.update(player_tracks, frame)
+
+            # Merge velocity dicts according to attractor_source
+            if args.attractor_source == "bbox":
+                merged_vels = bbox_vels
+            elif args.attractor_source == "keypoints":
+                merged_vels = kp_vels
+            else:  # combined: keypoints take priority, bbox fills gaps
+                merged_vels = {**bbox_vels, **kp_vels}
+
+            # Expose velocities for arrow visualisation (use whichever is active)
+            velocities = merged_vels if merged_vels else None
+
+            # Choose direction vectors based on attractor mode
             if args.attractor_mode == "acceleration":
-                direction_vectors = vel_tracker.get_accelerations()
+                if bbox_vel_tracker is not None and args.attractor_source in ("bbox", "combined"):
+                    bbox_acc = bbox_vel_tracker.get_accelerations()
+                else:
+                    bbox_acc = {}
+                if kp_vel_tracker is not None and args.attractor_source in ("keypoints", "combined"):
+                    kp_acc = kp_vel_tracker.get_accelerations()
+                else:
+                    kp_acc = {}
+
+                if args.attractor_source == "bbox":
+                    direction_vectors = bbox_acc
+                elif args.attractor_source == "keypoints":
+                    direction_vectors = kp_acc
+                else:
+                    direction_vectors = {**bbox_acc, **kp_acc}
             else:
-                direction_vectors = velocities
+                direction_vectors = merged_vels
+
+            # Determine anchor point for distance / directional weighting.
+            # Prefer the ball when detected; fall back to the previous smoothed
+            # attractor position to avoid losing the weighting on missed frames.
+            anchor_pt: tuple[float, float] | None = None
+            if ball_track is not None:
+                anchor_pt = ball_track.center
+            elif _prev_attractor_pt is not None:
+                anchor_pt = _prev_attractor_pt
 
             raw_attractor = estimate_attractor(
                 direction_vectors,
                 frame_shape=(frame_h, frame_w),
+                anchor_point=anchor_pt,
+                distance_sigma=args.attractor_dist_sigma,
+                directional_weight=args.attractor_directional,
             )
 
             # Apply Kalman smoother (or use raw directly if smoothing disabled)
@@ -561,6 +695,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 )
             else:
                 attractor = raw_attractor
+
+            # Cache the smoothed position for next frame's anchor fallback
+            if attractor is not None:
+                _prev_attractor_pt = attractor.point
 
         # -- Visualization ----------------------------------------------------
         annotated = visualizer.draw_frame(

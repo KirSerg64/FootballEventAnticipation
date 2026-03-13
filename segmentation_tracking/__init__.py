@@ -18,7 +18,7 @@ from segmentation_tracking.association import PlayerTrack, BallTrack, associate_
 from segmentation_tracking.visualization import Visualizer
 from segmentation_tracking.ball_kalman import BallKalmanFilter, AdaptiveBallKalmanFilter, BallDCFTracker, BallMotionState
 from segmentation_tracking.team_classifier import TeamClassifier
-from segmentation_tracking.vector_field import PlayerVelocityTracker, AttractorEstimate, estimate_attractor, AttractorSmoother
+from segmentation_tracking.vector_field import PlayerVelocityTracker, KeypointVelocityTracker, AttractorEstimate, estimate_attractor, AttractorSmoother
 
 __all__ = [
     "SegmentationTracker",
@@ -33,6 +33,7 @@ __all__ = [
     "BallMotionState",
     "TeamClassifier",
     "PlayerVelocityTracker",
+    "KeypointVelocityTracker",
     "AttractorEstimate",
     "estimate_attractor",
     "AttractorSmoother",
