@@ -37,6 +37,7 @@ Optional flags::
     --kp_detect_interval 1                Re-detect pose every N frames; flow tracks between
     --cotracker_checkpoint               Optional CoTracker3 .pth checkpoint path
     --cotracker_model    cotracker3_online  CoTracker3 hub model: cotracker3_online|cotracker3_offline
+    --ct_trail_len       0                Number of frames to draw CoTracker point trajectories (0=off)
     --attractor_dist_sigma 0.0            Gaussian distance-weighting sigma (px); 0=disabled
     --attractor_directional               Enable directional weighting (toward-anchor cosine)
     --export_json                         Export player_tracks.json + ball_track.json
@@ -281,6 +282,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "'cotracker3_offline' accumulates all frames since the last "
             "re-detection and runs batch inference on them — higher accuracy "
             "but results are only updated at each detect_interval boundary."
+        ),
+    )
+    parser.add_argument(
+        "--ct_trail_len", type=int, default=0,
+        help=(
+            "Number of past frames whose CoTracker3 point positions are drawn "
+            "as a trajectory trail on each output frame (default: 0 = disabled).  "
+            "Trails are colour-coded by player ID and fade from semi-transparent "
+            "at the oldest position to opaque at the current position.  "
+            "Requires --kp_flow_backend cotracker and "
+            "--attractor_source keypoints|combined.  "
+            "A value of 30 gives a ~1-second trail at 30 fps."
         ),
     )
     # Distance and directional weighting for the attractor
@@ -555,12 +568,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     writer = _open_video_writer(args.output, cap, codec=args.codec)
+    _show_ct_traj = args.ct_trail_len > 0 and args.kp_flow_backend == "cotracker"
     visualizer = Visualizer(
         mask_alpha=args.mask_alpha,
         show_skeleton=not args.no_skeleton,
         show_ball=not args.no_ball,
         show_ball_debug=args.ball_debug,
         show_attractor=args.show_attractor,
+        show_ct_trajectories=_show_ct_traj,
     )
 
     # ── Vector-field attractor trackers (only allocated when needed) ──────────
@@ -571,7 +586,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if args.show_attractor and args.attractor_source in ("bbox", "combined")
         else None
     )
-    # keypoint-based tracker (used in 'keypoints' and 'combined' modes)
+    # Decide whether CoTracker trajectories are needed.
+    # They require the keypoint tracker with cotracker backend.
+    _need_kp_tracker = (
+        (args.show_attractor and args.attractor_source in ("keypoints", "combined"))
+        or _show_ct_traj
+    )
+    # keypoint-based tracker (used in 'keypoints'/'combined' modes or for trajectories)
     kp_vel_tracker: KeypointVelocityTracker | None = (
         KeypointVelocityTracker(
             history_len=args.attractor_history,
@@ -580,8 +601,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             device=args.device,
             cotracker_checkpoint=args.cotracker_checkpoint,
             cotracker_model=args.cotracker_model,
+            ct_trail_len=args.ct_trail_len,
         )
-        if args.show_attractor and args.attractor_source in ("keypoints", "combined")
+        if _need_kp_tracker
         else None
     )
     # Kalman smoother for the attractor position
@@ -645,6 +667,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         # -- Vector-field attractor (optional) --------------------------------
         velocities = None
         attractor = None
+        _kp_tracker_ran = False
         if args.show_attractor:
             # Collect velocity dicts from active trackers
             bbox_vels: dict = {}
@@ -653,8 +676,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             if bbox_vel_tracker is not None:
                 bbox_vels = bbox_vel_tracker.update(player_tracks)
 
-            if kp_vel_tracker is not None:
+            if kp_vel_tracker is not None and args.attractor_source in ("keypoints", "combined"):
                 kp_vels = kp_vel_tracker.update(player_tracks, frame)
+                _kp_tracker_ran = True
 
             # Merge velocity dicts according to attractor_source
             if args.attractor_source == "bbox":
@@ -716,12 +740,22 @@ def run_pipeline(args: argparse.Namespace) -> None:
             if attractor is not None:
                 _prev_attractor_pt = attractor.point
 
+        # Run the keypoint tracker for trajectory-only case (no attractor)
+        if _show_ct_traj and not _kp_tracker_ran and kp_vel_tracker is not None:
+            kp_vel_tracker.update(player_tracks, frame)
+
+        # Collect CoTracker3 trajectories for visualisation
+        ct_trajectories: dict | None = None
+        if _show_ct_traj and kp_vel_tracker is not None:
+            ct_trajectories = kp_vel_tracker.get_ct_trajectories() or None
+
         # -- Visualization ----------------------------------------------------
         annotated = visualizer.draw_frame(
             frame, player_tracks, ball_track,
             frame_idx=frame_idx,
             velocities=velocities,
             attractor=attractor,
+            ct_trajectories=ct_trajectories,
         )
         writer.write(annotated)
 

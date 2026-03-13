@@ -330,6 +330,7 @@ class _CoTrackerState:
         checkpoint: str | None,
         device_str: str,
         hub_model: str = "cotracker3_online",
+        trail_len: int = 0,
     ) -> None:
         """Load the CoTracker3 model via ``torch.hub.load``.
 
@@ -348,6 +349,9 @@ class _CoTrackerState:
         hub_model:
             Hub entry point identifier.  Must be one of
             ``"cotracker3_online"`` or ``"cotracker3_offline"``.
+        trail_len:
+            Number of past positions to retain for each tracked point to draw
+            trajectories.  ``0`` disables history storage.
         """
         import torch
 
@@ -355,6 +359,7 @@ class _CoTrackerState:
             device_str if torch.cuda.is_available() else "cpu"
         )
         self._hub_model = hub_model
+        self._trail_len: int = max(0, int(trail_len))
 
         if hub_model not in ("cotracker3_online", "cotracker3_offline"):
             raise ValueError(
@@ -401,6 +406,9 @@ class _CoTrackerState:
         self._queries = None
         # Latest tracked positions: {flat_point_index → (x, y)}
         self.positions: dict[int, tuple[float, float]] = {}
+        # Per-point position history for trajectory drawing.
+        # {flat_point_index → deque[(x, y), maxlen=trail_len]}
+        self._position_history: dict[int, deque] = {}
 
     # ── Point-query management ────────────────────────────────────────────────
 
@@ -458,11 +466,39 @@ class _CoTrackerState:
         self._initialized = False
         self._pending = 0
         self.positions = {}
+        self._position_history = {}
         # For offline mode, clear the frame buffer so we only accumulate frames
         # from this detection onwards.
         if self._hub_model == "cotracker3_offline":
             self._frame_buf = []
         return point_map
+
+    # ── Trajectory history ────────────────────────────────────────────────────
+
+    def _update_position_history(self) -> None:
+        """Append current :attr:`positions` to :attr:`_position_history`.
+
+        Called automatically after each inference step when *trail_len* > 0.
+        """
+        if self._trail_len <= 0:
+            return
+        for idx, pos in self.positions.items():
+            if idx not in self._position_history:
+                self._position_history[idx] = deque(maxlen=self._trail_len)
+            self._position_history[idx].append(pos)
+
+    def get_trajectories(self) -> dict[int, list[tuple[float, float]]]:
+        """Return the per-point position history.
+
+        Returns
+        -------
+        dict[int, list[tuple[float, float]]]
+            Mapping from flat point index to ordered list of ``(x, y)``
+            positions (oldest → newest), limited to the last *trail_len*
+            frames.  Returns an empty dict when *trail_len* is 0 or no
+            inference has run yet.
+        """
+        return {idx: list(hist) for idx, hist in self._position_history.items()}
 
     # ── Per-frame stepping ────────────────────────────────────────────────────
 
@@ -524,6 +560,7 @@ class _CoTrackerState:
             i: (float(last_pos[i, 0]), float(last_pos[i, 1]))
             for i in range(len(last_pos))
         }
+        self._update_position_history()
         self._initialized = True
         self._pending = 0
         return True
@@ -559,6 +596,7 @@ class _CoTrackerState:
             i: (float(last_pos[i, 0]), float(last_pos[i, 1]))
             for i in range(len(last_pos))
         }
+        self._update_position_history()
         self._initialized = True
         self._pending = 0
         return True
@@ -630,6 +668,10 @@ class KeypointVelocityTracker:
         (batch inference over the full frame buffer since last re-detection).
         Passed directly to ``torch.hub.load("facebookresearch/co-tracker",
         cotracker_model)``.
+    ct_trail_len:
+        Number of past CoTracker point positions to retain for trajectory
+        visualisation.  ``0`` (the default) disables history storage.
+        Exposed via :meth:`get_ct_trajectories`.
     """
 
     def __init__(
@@ -642,6 +684,7 @@ class KeypointVelocityTracker:
         device: str = "cuda",
         cotracker_checkpoint: str | None = None,
         cotracker_model: str = "cotracker3_online",
+        ct_trail_len: int = 0,
     ) -> None:
         if history_len < 1:
             raise ValueError("history_len must be at least 1")
@@ -660,6 +703,7 @@ class KeypointVelocityTracker:
         self._device = device
         self._cotracker_checkpoint = cotracker_checkpoint
         self._cotracker_model = cotracker_model
+        self._ct_trail_len = max(0, int(ct_trail_len))
 
         # Sliding position / velocity history (same structure as PlayerVelocityTracker)
         self._history: dict[int, deque[tuple[float, float]]] = {}
@@ -968,6 +1012,7 @@ class KeypointVelocityTracker:
                 self._cotracker_checkpoint,
                 self._device,
                 hub_model=self._cotracker_model,
+                trail_len=self._ct_trail_len,
             )
             logger.info(
                 "CoTracker3 backend initialised (hub_model=%s, device=%s)",
@@ -1043,6 +1088,59 @@ class KeypointVelocityTracker:
                         pt.keypoints, getattr(pt, "keypoint_scores", None), pt.bbox
                     )
 
+        return result
+
+    def get_ct_trajectories(
+        self,
+    ) -> dict[int, list[tuple[float, float]]]:
+        """Return per-player CoTracker point trajectories.
+
+        Each player's trajectory is the averaged position of their tracked
+        keypoints across recent frames, giving a smooth centre-of-motion path.
+
+        Returns
+        -------
+        dict[int, list[tuple[float, float]]]
+            ``{player_id: [(x0, y0), (x1, y1), ..., (x_cur, y_cur)]}`` where
+            positions are ordered oldest → newest.  Returns an empty dict when
+            the CoTracker backend is not active, when no queries are registered,
+            or when *ct_trail_len* is 0.
+        """
+        if self._ct_state is None or self._ct_trail_len == 0:
+            return {}
+
+        flat_histories = self._ct_state.get_trajectories()
+        if not flat_histories or not self._ct_point_map:
+            return {}
+
+        # Invert point map: player_id → list of flat indices
+        pid_to_flat: dict[int, list[int]] = {}
+        for flat_idx, (pid, _) in enumerate(self._ct_point_map):
+            pid_to_flat.setdefault(pid, []).append(flat_idx)
+
+        # For each player average the per-frame positions across their keypoints
+        result: dict[int, list[tuple[float, float]]] = {}
+        for pid, flat_indices in pid_to_flat.items():
+            # Gather histories, keeping only those with data
+            hists = [flat_histories[fi] for fi in flat_indices if fi in flat_histories]
+            if not hists:
+                continue
+            # Max length across all points for this player
+            n_frames = max(len(h) for h in hists)
+            traj: list[tuple[float, float]] = []
+            for t in range(n_frames):
+                xs, ys = [], []
+                for h in hists:
+                    # Some histories may be shorter (e.g. point added later)
+                    offset = n_frames - len(h)
+                    hi = t - offset
+                    if hi >= 0:
+                        xs.append(h[hi][0])
+                        ys.append(h[hi][1])
+                if xs:
+                    traj.append((float(np.mean(xs)), float(np.mean(ys))))
+            if len(traj) >= 2:
+                result[pid] = traj
         return result
 
 

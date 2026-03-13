@@ -123,6 +123,12 @@ class Visualizer:
 
         Requires caller to pass ``velocities`` and ``attractor`` to
         :meth:`draw_frame`.  Defaults to *False*.
+    show_ct_trajectories:
+        When *True*, draw the per-player CoTracker3 point trajectory trails.
+        Each trail is a polyline of the last *ct_trail_len* positions for
+        each tracked keypoint cluster, colour-coded by player ID.  Requires
+        the caller to pass ``ct_trajectories`` to :meth:`draw_frame`.
+        Defaults to *False*.
     keypoint_conf_threshold:
         Only draw keypoints whose confidence exceeds this value.
     """
@@ -136,6 +142,7 @@ class Visualizer:
         show_ball: bool = True,
         show_ball_debug: bool = False,
         show_attractor: bool = False,
+        show_ct_trajectories: bool = False,
         keypoint_conf_threshold: float = _KP_CONF_THRESHOLD,
     ) -> None:
         self.mask_alpha = mask_alpha
@@ -145,6 +152,7 @@ class Visualizer:
         self.show_ball = show_ball
         self.show_ball_debug = show_ball_debug
         self.show_attractor = show_attractor
+        self.show_ct_trajectories = show_ct_trajectories
         self.keypoint_conf_threshold = keypoint_conf_threshold
 
         # Running detection-source counters (reset on demand via reset_ball_stats)
@@ -172,6 +180,7 @@ class Visualizer:
         frame_idx: int | None = None,
         velocities: dict[int, tuple[float, float, float, float]] | None = None,
         attractor: AttractorEstimate | None = None,
+        ct_trajectories: dict[int, list[tuple[float, float]]] | None = None,
     ) -> np.ndarray:
         """
         Annotate a single frame and return the result.
@@ -198,6 +207,11 @@ class Visualizer:
             Optional :class:`~segmentation_tracking.vector_field.AttractorEstimate`
             from :func:`~segmentation_tracking.vector_field.estimate_attractor`.
             Drawn when ``show_attractor`` is *True*.
+        ct_trajectories:
+            Optional mapping ``{player_id: [(x0,y0), ..., (x_cur,y_cur)]}``
+            from
+            :meth:`~segmentation_tracking.vector_field.KeypointVelocityTracker.get_ct_trajectories`.
+            Drawn when ``show_ct_trajectories`` is *True*.
 
         Returns
         -------
@@ -205,6 +219,10 @@ class Visualizer:
             Annotated BGR image of the same shape as *frame*.
         """
         canvas = frame.copy()
+
+        # Draw CoTracker3 trajectories beneath everything else
+        if self.show_ct_trajectories and ct_trajectories:
+            self._draw_ct_trajectories(canvas, ct_trajectories)
 
         # Draw player segmentation masks (colour overlay)
         for track in player_tracks:
@@ -275,6 +293,45 @@ class Visualizer:
         )[mask_bool]
 
         return canvas
+
+    def _draw_ct_trajectories(
+        self,
+        canvas: np.ndarray,
+        ct_trajectories: dict[int, list[tuple[float, float]]],
+    ) -> None:
+        """Draw CoTracker3 point trajectory trails as colour-coded polylines.
+
+        Each player's trail is drawn as a series of connected circles and
+        line segments fading from semi-transparent (oldest) to opaque (newest).
+        The colour matches the player's ID colour so trails are visually
+        associated with the correct player.
+
+        Parameters
+        ----------
+        canvas:
+            BGR image to draw onto (modified in-place).
+        ct_trajectories:
+            ``{player_id: [(x0,y0), ..., (x_cur,y_cur)]}`` mapping, oldest
+            position first.
+        """
+        for pid, pts in ct_trajectories.items():
+            if len(pts) < 2:
+                continue
+            color = _id_to_color(pid)
+            n = len(pts)
+            for i in range(1, n):
+                # Fade opacity: oldest segment is 20% opacity, newest is 100%
+                alpha = 0.20 + 0.80 * (i / (n - 1))
+                x0, y0 = int(round(pts[i - 1][0])), int(round(pts[i - 1][1]))
+                x1, y1 = int(round(pts[i][0])), int(round(pts[i][1]))
+                # Blend the line segment with the canvas
+                overlay = canvas.copy()
+                cv2.line(overlay, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+                cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0, canvas)
+            # Draw a solid dot at the current (newest) position
+            cx, cy = int(round(pts[-1][0])), int(round(pts[-1][1]))
+            cv2.circle(canvas, (cx, cy), 4, color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, (cx, cy), 4, (255, 255, 255), 1, cv2.LINE_AA)
 
     @staticmethod
     def _draw_bbox(
