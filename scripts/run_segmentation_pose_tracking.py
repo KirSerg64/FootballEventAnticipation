@@ -18,7 +18,8 @@ Optional flags::
 
     --sam_model          sam2.1_b.pt      SAM2 model weights (downloaded if absent)
     --det_model          yolo11x.pt       YOLO detection model
-    --pose_model         yolo11x-pose.pt  YOLO pose model for keypoints
+    --pose_model         yolo11x-pose.pt  YOLO pose model for keypoints (yolo backend only)
+    --pose_backend       auto             Pose backend: auto|keypointrcnn|bboxmaskpose|yolo
     --max_frames         N                Process only the first N frames
     --conf               0.25             Detection confidence threshold
     --iou                0.3              IoU threshold for ID matching
@@ -107,7 +108,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose_model", default="yolo11x-pose.pt",
-        help="YOLO pose model (default: yolo11x-pose.pt)",
+        help="YOLO pose model (default: yolo11x-pose.pt; used only when --pose_backend yolo)",
+    )
+    parser.add_argument(
+        "--pose_backend", default="auto",
+        choices=["auto", "keypointrcnn", "bboxmaskpose", "yolo"],
+        help=(
+            "Pose estimation backend (default: auto).  "
+            "'auto' tries KeypointRCNN first, then falls back to YOLO.  "
+            "'keypointrcnn' uses torchvision ResNet-50 FPN (no extra install).  "
+            "'bboxmaskpose' uses BBoxMaskPose ViTPose (requires --bbox_config, "
+            "--bbox_checkpoint, --det_config, --det_checkpoint).  "
+            "'yolo' uses the legacy YOLO pose model (--pose_model)."
+        ),
+    )
+    # BBoxMaskPose-specific options
+    parser.add_argument(
+        "--bbox_config", default=None,
+        help="BBoxMaskPose pose model config file (required for --pose_backend bboxmaskpose).",
+    )
+    parser.add_argument(
+        "--bbox_checkpoint", default=None,
+        help="BBoxMaskPose pose model checkpoint (required for --pose_backend bboxmaskpose).",
+    )
+    parser.add_argument(
+        "--det_config", default=None,
+        help="Person detector config for BBoxMaskPose (required for --pose_backend bboxmaskpose).",
+    )
+    parser.add_argument(
+        "--det_checkpoint", default=None,
+        help="Person detector checkpoint for BBoxMaskPose (required for --pose_backend bboxmaskpose).",
+    )
+    parser.add_argument(
+        "--krcnn_weights", default=None,
+        help="Optional local weights file for the KeypointRCNN backend.",
     )
     parser.add_argument(
         "--max_frames", type=int, default=None,
@@ -275,11 +309,92 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def _load_pose_model(pose_model_path: str, device: str):
-    """Lazy-load the YOLO pose model."""
-    from ultralytics import YOLO
-    logger.info("Loading YOLO pose model: %s", pose_model_path)
-    return YOLO(pose_model_path)
+def _build_pose_estimator(args: argparse.Namespace):
+    """Return a pose estimator object appropriate for *args.pose_backend*.
+
+    Returns one of:
+
+    * A ``pose_estimation.pose_model.BasePoseEstimator`` (new backends).
+    * A YOLO model (legacy ``--pose_backend yolo``).
+
+    The object is then passed to ``_run_pose_on_frame`` which handles both APIs.
+    """
+    backend = args.pose_backend
+
+    if backend == "yolo":
+        from ultralytics import YOLO
+        logger.info("Loading YOLO pose model: %s", args.pose_model)
+        return YOLO(args.pose_model)
+
+    # New pose_estimation backends
+    import torch
+    from pose_estimation.pose_model import create_pose_estimator
+
+    device = torch.device(
+        "cuda" if args.device.startswith("cuda") and torch.cuda.is_available()
+        else "cpu"
+    )
+
+    try:
+        estimator = create_pose_estimator(
+            device=device,
+            backend="keypointrcnn" if backend == "keypointrcnn" else
+                    "bboxmaskpose" if backend == "bboxmaskpose" else "auto",
+            score_threshold=args.conf,
+            weights_path=getattr(args, "krcnn_weights", None),
+            bbox_config=getattr(args, "bbox_config", None),
+            bbox_checkpoint=getattr(args, "bbox_checkpoint", None),
+            det_config=getattr(args, "det_config", None),
+            det_checkpoint=getattr(args, "det_checkpoint", None),
+        )
+        logger.info(
+            "Pose estimator ready: %s (device=%s)",
+            type(estimator).__name__,
+            device,
+        )
+        return estimator
+    except Exception as exc:
+        if backend == "auto":
+            # Fall back to YOLO
+            logger.warning(
+                "pose_estimation backend unavailable (%s); falling back to YOLO pose model %s",
+                exc,
+                args.pose_model,
+            )
+            from ultralytics import YOLO
+            return YOLO(args.pose_model)
+        raise
+
+
+def _run_pose_on_frame(pose_estimator, frame, args: argparse.Namespace):
+    """Run pose inference for a single frame.
+
+    Returns a pose result object compatible with :func:`associate_poses_with_tracks`.
+    The result is either a YOLO pose result or a
+    ``pose_estimation.pose_model.PoseResult`` — both are accepted by the
+    updated association module.
+    """
+    # Detect backend type by duck-typing
+    if hasattr(pose_estimator, "predict") and hasattr(pose_estimator, "num_persons"):
+        # Should not normally happen (BasePoseEstimator doesn't have num_persons)
+        return pose_estimator.predict(frame)
+
+    # Check if it's the new pose_estimation BasePoseEstimator
+    try:
+        from pose_estimation.pose_model import BasePoseEstimator
+        if isinstance(pose_estimator, BasePoseEstimator):
+            return pose_estimator.predict(frame)
+    except ImportError:
+        pass
+
+    # Legacy YOLO path
+    result_list = pose_estimator.predict(
+        frame,
+        conf=args.conf,
+        device=args.device,
+        verbose=False,
+    )
+    return result_list[0] if result_list else None
 
 
 def _open_video_writer(
@@ -334,8 +449,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("Segmentation complete: %d frames", len(seg_results))
 
     # -- Step 2: Pose estimation -----------------------------------------------
-    logger.info("=== Step 2: Pose estimation ===")
-    pose_model = _load_pose_model(args.pose_model, args.device)
+    logger.info(
+        "=== Step 2: Pose estimation (backend=%s) ===",
+        args.pose_backend,
+    )
+    pose_estimator = _build_pose_estimator(args)
 
     # -- Team colour classifier (optional) ------------------------------------
     team_classifier: TeamClassifier | None = None
@@ -388,13 +506,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         # -- Pose estimation for this frame -----------------------------------
         try:
-            pose_result_list = pose_model.predict(
-                frame,
-                conf=args.conf,
-                device=args.device,
-                verbose=False,
-            )
-            pose_result = pose_result_list[0] if pose_result_list else None
+            pose_result = _run_pose_on_frame(pose_estimator, frame, args)
         except Exception as exc:
             logger.warning("Pose estimation failed on frame %d: %s", frame_idx, exc)
             pose_result = None

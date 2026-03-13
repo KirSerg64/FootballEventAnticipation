@@ -1,7 +1,7 @@
 """
 association.py
 --------------
-Matches YOLO pose estimation keypoints to segmentation-tracked players.
+Matches pose estimation keypoints to segmentation-tracked players.
 
 The association is performed by computing the Intersection-over-Union (IoU)
 between each pose bounding box and the per-player segmentation mask bbox.
@@ -12,6 +12,18 @@ received no IoU match above the threshold.
 
 If no pose detection overlaps with a given tracked player the track is still
 returned, but with ``keypoints = None``.
+
+Supported pose result formats
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``associate_poses_with_tracks`` accepts **two different** pose result objects:
+
+1. **YOLO pose result** (ultralytics API):
+   ``pose_result.keypoints`` (YOLO tensor), ``pose_result.boxes`` (YOLO tensor).
+
+2. **pose_estimation.pose_model.PoseResult** (new, higher-performance backend):
+   Plain numpy arrays — ``pose_result.keypoints`` ``(N, 17, 2)``,
+   ``pose_result.scores`` ``(N, 17)``, ``pose_result.bboxes`` ``(N, 4)``.
+   Detected by the presence of a ``num_persons`` attribute.
 
 Data structures
 ~~~~~~~~~~~~~~~
@@ -240,34 +252,43 @@ def associate_poses_with_tracks(
     pose_keypoints: list[np.ndarray] = []
     pose_scores: list[np.ndarray] = []
 
-    if pose_result is not None and pose_result.keypoints is not None:
-        kps = pose_result.keypoints
-        boxes = pose_result.boxes
+    if pose_result is not None:
+        if hasattr(pose_result, "num_persons"):
+            # ── New pose_estimation.pose_model.PoseResult format ──────────────
+            # Plain numpy arrays: keypoints (N,17,2), scores (N,17), bboxes (N,4)
+            for i in range(pose_result.num_persons):
+                pose_bboxes.append(pose_result.bboxes[i].astype(np.float32))
+                pose_keypoints.append(pose_result.keypoints[i].astype(np.float32))
+                pose_scores.append(pose_result.scores[i].astype(np.float32))
+        elif hasattr(pose_result, "keypoints") and pose_result.keypoints is not None:
+            # ── Legacy YOLO ultralytics pose result format ────────────────────
+            kps = pose_result.keypoints
+            boxes = pose_result.boxes
 
-        for i in range(len(kps)):
-            if boxes is not None and i < len(boxes):
-                bbox_i = boxes.xyxy[i].cpu().numpy().astype(np.float32)
-            else:
-                xy = kps.xy[i].cpu().numpy()
-                valid = xy[(xy[:, 0] > 0) | (xy[:, 1] > 0)]
-                if len(valid) == 0:
-                    continue
-                bbox_i = np.array(
-                    [valid[:, 0].min(), valid[:, 1].min(),
-                     valid[:, 0].max(), valid[:, 1].max()],
-                    dtype=np.float32,
+            for i in range(len(kps)):
+                if boxes is not None and i < len(boxes):
+                    bbox_i = boxes.xyxy[i].cpu().numpy().astype(np.float32)
+                else:
+                    xy = kps.xy[i].cpu().numpy()
+                    valid = xy[(xy[:, 0] > 0) | (xy[:, 1] > 0)]
+                    if len(valid) == 0:
+                        continue
+                    bbox_i = np.array(
+                        [valid[:, 0].min(), valid[:, 1].min(),
+                         valid[:, 0].max(), valid[:, 1].max()],
+                        dtype=np.float32,
+                    )
+
+                kp_xy = kps.xy[i].cpu().numpy()      # (17, 2)
+                kp_conf = (
+                    kps.conf[i].cpu().numpy()         # (17,)
+                    if kps.conf is not None
+                    else np.ones(len(kp_xy), dtype=np.float32)
                 )
 
-            kp_xy = kps.xy[i].cpu().numpy()      # (17, 2)
-            kp_conf = (
-                kps.conf[i].cpu().numpy()         # (17,)
-                if kps.conf is not None
-                else np.ones(len(kp_xy), dtype=np.float32)
-            )
-
-            pose_bboxes.append(bbox_i)
-            pose_keypoints.append(kp_xy)
-            pose_scores.append(kp_conf)
+                pose_bboxes.append(bbox_i)
+                pose_keypoints.append(kp_xy)
+                pose_scores.append(kp_conf)
 
     # -- Hungarian IoU matching -----------------------------------------------
     n_tracks = len(seg_result.player_ids)
