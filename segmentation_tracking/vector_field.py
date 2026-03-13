@@ -27,8 +27,11 @@ This module implements:
 
    * ``"lk"`` — Lucas-Kanade pyramidal optical flow via ``cv2.calcOpticalFlowPyrLK``
      (fast, CPU-only, no extra dependencies).
-   * ``"cotracker"`` — CoTracker3 online sliding-window transformer
-     (higher accuracy, requires ``pip install cotracker`` and a GPU).
+   * ``"cotracker"`` — CoTracker3 tracker loaded via
+     ``torch.hub.load("facebookresearch/co-tracker", cotracker_model)``
+     (higher accuracy, GPU recommended).  Supports both
+     ``"cotracker3_online"`` (streaming sliding-window) and
+     ``"cotracker3_offline"`` (batch inference over accumulated frames).
 
    A *detect_interval* parameter controls how often the underlying pose result
    is used to re-anchor the flow tracker, suppressing drift.
@@ -289,34 +292,96 @@ class PlayerVelocityTracker:
 
 
 # ---------------------------------------------------------------------------
-# _CoTrackerState — internal CoTracker3 online-mode helper
+# _CoTrackerState — internal CoTracker3 helper (online + offline hub models)
 # ---------------------------------------------------------------------------
 
 class _CoTrackerState:
-    """Wraps the CoTracker3 online predictor for streaming per-frame tracking.
+    """Wraps a CoTracker3 hub model for streaming per-frame keypoint tracking.
 
     Not part of the public API.  Instantiated lazily by
     :class:`KeypointVelocityTracker` when ``flow_backend="cotracker"``.
 
-    The online predictor processes frames in windows of ``2 * step`` frames
-    (typically 16).  This class buffers incoming frames and fires inference
-    every ``step`` new frames, returning the tracked positions for the most
-    recent frame.  There is therefore a maximum latency of ``step`` frames
-    (≈ 0.3 s at 25 fps) before the first output is available.
+    Two CoTracker3 hub models are supported, both loaded via
+    ``torch.hub.load("facebookresearch/co-tracker", <model>)``:
+
+    * ``"cotracker3_online"`` — sliding-window online predictor.
+      Processes frames in windows of ``2 * step`` frames (typically 16) and
+      fires inference every ``step`` new frames.  Maximum latency of ``step``
+      frames (≈ 0.3 s at 25 fps) before the first output is available.
+
+    * ``"cotracker3_offline"`` — offline predictor that processes the
+      accumulated frame buffer as a single batch.  Invoked at every
+      re-anchor (``detect_interval``) so the buffer always contains exactly
+      the frames collected since the last keypoint detection.  Positions for
+      all intermediate frames are extracted from the batch output so that the
+      ``positions`` dict always reflects the most recently seen frame.
+
+    Both models use the same ``(x, y)`` pixel-coordinate output format and the
+    same :meth:`set_queries` / :meth:`add_frame` / :meth:`maybe_run` API so
+    that :class:`KeypointVelocityTracker` does not need to know which model is
+    active.
     """
 
-    def __init__(self, checkpoint: str | None, device_str: str) -> None:
+    #: Hub source for torch.hub.load
+    _HUB_SOURCE = "facebookresearch/co-tracker"
+
+    def __init__(
+        self,
+        checkpoint: str | None,
+        device_str: str,
+        hub_model: str = "cotracker3_online",
+    ) -> None:
+        """Load the CoTracker3 model via ``torch.hub.load``.
+
+        Parameters
+        ----------
+        checkpoint:
+            Optional local path to a ``.pth`` checkpoint.  When *None* the
+            hub's default pretrained weights are used.  For the online model
+            the checkpoint is passed directly; for the offline model it is
+            used via ``torch.hub.load`` with ``pretrained=False`` followed by
+            a manual ``load_state_dict``.
+        device_str:
+            Torch device string (e.g. ``"cuda"`` or ``"cpu"``).  CUDA
+            availability is checked at init time; the device falls back to CPU
+            if CUDA is not available.
+        hub_model:
+            Hub entry point identifier.  Must be one of
+            ``"cotracker3_online"`` or ``"cotracker3_offline"``.
+        """
         import torch
-        from cotracker.predictor import CoTrackerOnlinePredictor  # type: ignore[import]
 
         self._device = torch.device(
             device_str if torch.cuda.is_available() else "cpu"
         )
-        self._predictor = (
-            CoTrackerOnlinePredictor(checkpoint=checkpoint).to(self._device)
-        )
+        self._hub_model = hub_model
+
+        if hub_model not in ("cotracker3_online", "cotracker3_offline"):
+            raise ValueError(
+                f"hub_model must be 'cotracker3_online' or 'cotracker3_offline'; "
+                f"got {hub_model!r}"
+            )
+
+        # Load via torch.hub; optionally replace weights with a local checkpoint
+        if checkpoint is not None:
+            # Load architecture with default weights then overwrite
+            predictor = torch.hub.load(
+                self._HUB_SOURCE, hub_model, pretrained=False, trust_repo=True
+            )
+            state = torch.load(checkpoint, map_location="cpu")
+            # Hub models may wrap weights under a 'model' key
+            predictor.load_state_dict(
+                state.get("model", state), strict=False
+            )
+        else:
+            predictor = torch.hub.load(
+                self._HUB_SOURCE, hub_model, trust_repo=True
+            )
+
+        self._predictor = predictor.to(self._device)
         self._predictor.eval()
 
+        # ── Online-mode state ─────────────────────────────────────────────────
         # step / window come from the model; typical values: step=8, window=16
         try:
             self._step: int = int(self._predictor.step)
@@ -324,12 +389,13 @@ class _CoTrackerState:
             self._step = 8
 
         # Frame buffer: last 2*step BGR frames as (3, H, W) float tensors
+        # For offline mode we use the same buffer (no max cap — cleared each cycle).
         self._frame_buf: list = []
-        self._max_buf: int = 3 * self._step + 1
+        self._max_buf: int = 3 * self._step + 1  # used by online mode only
 
         # Frames buffered since last inference call (for scheduling)
         self._pending: int = 0
-        # Whether the first (initialisation) call has been made
+        # Whether the first (initialisation) call has been made (online only)
         self._initialized: bool = False
         # (1, N, 3) float32 query tensor: [t_in_chunk, x, y]
         self._queries = None
@@ -392,6 +458,10 @@ class _CoTrackerState:
         self._initialized = False
         self._pending = 0
         self.positions = {}
+        # For offline mode, clear the frame buffer so we only accumulate frames
+        # from this detection onwards.
+        if self._hub_model == "cotracker3_offline":
+            self._frame_buf = []
         return point_map
 
     # ── Per-frame stepping ────────────────────────────────────────────────────
@@ -403,12 +473,21 @@ class _CoTrackerState:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         t = torch.from_numpy(rgb).permute(2, 0, 1).float()  # (3, H, W)
         self._frame_buf.append(t)
-        if len(self._frame_buf) > self._max_buf:
+        if self._hub_model == "cotracker3_online" and len(self._frame_buf) > self._max_buf:
             self._frame_buf = self._frame_buf[-self._max_buf:]
         self._pending += 1
 
     def maybe_run(self) -> bool:
         """Run inference if enough frames are pending.
+
+        * **Online mode** — fires every ``step`` frames after the initial
+          ``2 * step``-frame warm-up.
+        * **Offline mode** — runs on the *entire* buffered frame sequence
+          whenever :meth:`maybe_run` is called with at least 2 frames.  The
+          positions for the *last* frame in the buffer are stored in
+          :attr:`positions`.  The buffer is **not** cleared so that calling
+          :meth:`add_frame` + :meth:`maybe_run` every frame keeps the
+          positions current.
 
         Returns *True* when inference was executed and :attr:`positions` was
         updated.
@@ -418,6 +497,10 @@ class _CoTrackerState:
         if self._queries is None:
             return False
 
+        if self._hub_model == "cotracker3_offline":
+            return self._maybe_run_offline()
+
+        # ── Online mode ───────────────────────────────────────────────────────
         need = self._step * 2 if not self._initialized else self._step
         if self._pending < need or len(self._frame_buf) < need:
             return False
@@ -434,6 +517,41 @@ class _CoTrackerState:
                 is_first_step=not self._initialized,
                 queries=self._queries if not self._initialized else None,
             )
+
+        # pred_tracks: (1, T, N, 2) — take positions at the last frame
+        last_pos = pred_tracks[0, -1].cpu().numpy()  # (N, 2)
+        self.positions = {
+            i: (float(last_pos[i, 0]), float(last_pos[i, 1]))
+            for i in range(len(last_pos))
+        }
+        self._initialized = True
+        self._pending = 0
+        return True
+
+    # ── Offline-mode helpers ──────────────────────────────────────────────────
+
+    def _maybe_run_offline(self) -> bool:
+        """Run offline CoTracker3 on the accumulated frame buffer.
+
+        The offline model requires at least 2 frames to process.  Query
+        timestamps are set to frame 0 (the first frame in the buffer).
+        Only the positions from the *last* frame are stored in
+        :attr:`positions`.
+        """
+        import torch
+
+        if len(self._frame_buf) < 2:
+            return False
+
+        # Re-stamp queries at t=0 (first frame of the current buffer)
+        queries_t0 = self._queries.clone()  # (1, N, 3)
+        queries_t0[0, :, 0] = 0.0  # t=0
+
+        # Build full video tensor: (1, T, 3, H, W)
+        video = torch.stack(self._frame_buf, dim=0).unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            pred_tracks, _ = self._predictor(video, queries=queries_t0)
 
         # pred_tracks: (1, T, N, 2) — take positions at the last frame
         last_pos = pred_tracks[0, -1].cpu().numpy()  # (N, 2)
@@ -469,9 +587,10 @@ class KeypointVelocityTracker:
     * ``"lk"`` — Lucas-Kanade pyramidal flow (``cv2.calcOpticalFlowPyrLK``).
       Fast CPU method, no extra dependencies.  Failed LK points fall back to
       the last known position so the tracker degrades gracefully.
-    * ``"cotracker"`` — CoTracker3 online sliding-window transformer.
-      Requires ``pip install cotracker`` and a CUDA-capable GPU.  Handles
-      occlusions and large displacements better than LK.
+    * ``"cotracker"`` — CoTracker3 tracker, loaded via
+      ``torch.hub.load("facebookresearch/co-tracker", <hub_model>)``.
+      Supports both online and offline inference modes.  Handles occlusions
+      and large displacements better than LK.
 
     When ``detect_interval=1`` (the default) the flow backend is never used —
     fresh keypoints from the pose estimator are read every frame.  This is
@@ -503,7 +622,14 @@ class KeypointVelocityTracker:
         ``"cuda"``.
     cotracker_checkpoint:
         Optional local path to a CoTracker3 ``.pth`` checkpoint.  If *None*
-        the default pretrained weights are downloaded automatically.
+        the default pretrained weights are downloaded automatically via
+        ``torch.hub``.
+    cotracker_model:
+        CoTracker3 hub model identifier.  One of ``"cotracker3_online"``
+        (default, streaming sliding-window) or ``"cotracker3_offline"``
+        (batch inference over the full frame buffer since last re-detection).
+        Passed directly to ``torch.hub.load("facebookresearch/co-tracker",
+        cotracker_model)``.
     """
 
     def __init__(
@@ -515,11 +641,16 @@ class KeypointVelocityTracker:
         min_kp_score: float = 0.3,
         device: str = "cuda",
         cotracker_checkpoint: str | None = None,
+        cotracker_model: str = "cotracker3_online",
     ) -> None:
         if history_len < 1:
             raise ValueError("history_len must be at least 1")
         if flow_backend not in ("lk", "cotracker"):
             raise ValueError("flow_backend must be 'lk' or 'cotracker'")
+        if cotracker_model not in ("cotracker3_online", "cotracker3_offline"):
+            raise ValueError(
+                "cotracker_model must be 'cotracker3_online' or 'cotracker3_offline'"
+            )
 
         self._history_len = history_len
         self._flow_backend = flow_backend
@@ -528,6 +659,7 @@ class KeypointVelocityTracker:
         self._min_kp_score = float(min_kp_score)
         self._device = device
         self._cotracker_checkpoint = cotracker_checkpoint
+        self._cotracker_model = cotracker_model
 
         # Sliding position / velocity history (same structure as PlayerVelocityTracker)
         self._history: dict[int, deque[tuple[float, float]]] = {}
@@ -833,9 +965,15 @@ class KeypointVelocityTracker:
             return True
         try:
             self._ct_state = _CoTrackerState(
-                self._cotracker_checkpoint, self._device
+                self._cotracker_checkpoint,
+                self._device,
+                hub_model=self._cotracker_model,
             )
-            logger.info("CoTracker3 backend initialised (device=%s)", self._device)
+            logger.info(
+                "CoTracker3 backend initialised (hub_model=%s, device=%s)",
+                self._cotracker_model,
+                self._device,
+            )
             return True
         except Exception as exc:
             logger.warning(

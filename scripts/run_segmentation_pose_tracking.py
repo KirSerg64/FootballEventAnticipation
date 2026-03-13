@@ -36,6 +36,7 @@ Optional flags::
     --kp_flow_backend    lk               Keypoint flow backend: lk|cotracker
     --kp_detect_interval 1                Re-detect pose every N frames; flow tracks between
     --cotracker_checkpoint               Optional CoTracker3 .pth checkpoint path
+    --cotracker_model    cotracker3_online  CoTracker3 hub model: cotracker3_online|cotracker3_offline
     --attractor_dist_sigma 0.0            Gaussian distance-weighting sigma (px); 0=disabled
     --attractor_directional               Enable directional weighting (toward-anchor cosine)
     --export_json                         Export player_tracks.json + ball_track.json
@@ -265,7 +266,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Optional local path to a CoTracker3 .pth checkpoint file.  "
             "If not provided, the default pretrained weights are downloaded "
-            "automatically (requires internet on first run)."
+            "automatically via torch.hub (requires internet on first run)."
+        ),
+    )
+    parser.add_argument(
+        "--cotracker_model", default="cotracker3_online",
+        choices=["cotracker3_online", "cotracker3_offline"],
+        help=(
+            "CoTracker3 hub model to load via "
+            "torch.hub.load('facebookresearch/co-tracker', MODEL) "
+            "(default: cotracker3_online).  "
+            "'cotracker3_online' uses a sliding-window online predictor — low "
+            "latency, processes every step frames.  "
+            "'cotracker3_offline' accumulates all frames since the last "
+            "re-detection and runs batch inference on them — higher accuracy "
+            "but results are only updated at each detect_interval boundary."
         ),
     )
     # Distance and directional weighting for the attractor
@@ -564,6 +579,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             detect_interval=args.kp_detect_interval,
             device=args.device,
             cotracker_checkpoint=args.cotracker_checkpoint,
+            cotracker_model=args.cotracker_model,
         )
         if args.show_attractor and args.attractor_source in ("keypoints", "combined")
         else None
