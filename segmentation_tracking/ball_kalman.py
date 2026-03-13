@@ -1526,6 +1526,16 @@ class BallCoTrackerTracker:
                 queries=self._queries if not self._ct_initialized else None,
             )
 
+        # The online model returns None on the warm-up (first) step while it
+        # initialises its internal sliding-window state.  Mark the model as
+        # initialised so the next call uses the normal step cadence, but do
+        # NOT update _ct_position yet — the caller will fall back to velocity
+        # extrapolation for this frame.
+        if pred_tracks is None:
+            self._ct_initialized = True
+            self._pending = 0
+            return False
+
         # pred_tracks: (1, T, 1, 2) — take last frame, point 0
         pos = pred_tracks[0, -1, 0].cpu().numpy()
         self._ct_position = (float(pos[0]), float(pos[1]))
@@ -1548,6 +1558,9 @@ class BallCoTrackerTracker:
         )
         with torch.no_grad():
             pred_tracks, _ = self._predictor(video, queries=queries_t0)
+
+        if pred_tracks is None:
+            return False
 
         pos = pred_tracks[0, -1, 0].cpu().numpy()
         self._ct_position = (float(pos[0]), float(pos[1]))
