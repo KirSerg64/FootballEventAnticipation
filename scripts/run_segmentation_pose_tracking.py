@@ -55,6 +55,8 @@ Optional flags::
     --ball_conf_roi      0.05            Ball YOLO confidence for ROI re-detection (stage-2, FRoG-MOT)
     --ball_tracker       dcf              Ball tracker backend: dcf|cotracker
     --ball_ct_redetect   15               CoTracker ball: YOLO re-anchor interval (frames)
+    --ball_det_model     None             Dedicated ball detection model (ONNX/YOLO, e.g. weights/yolov26_ball_det.onnx)
+    --ball_det_conf      0.25            Confidence threshold for the dedicated ball detector
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -422,6 +424,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ball_det_model", default=None,
+        help=(
+            "Optional path to a dedicated ball-detection model in ONNX or YOLO "
+            "format (e.g. 'weights/yolov26_ball_det.onnx').  When provided, this "
+            "model is used for both the global ball detection pass (stage-1) and "
+            "the ROI re-detection pass (stage-2) instead of the main YOLO model.  "
+            "The dedicated model must output class 0 as the ball class.  The main "
+            "YOLO result is kept as a fallback for stage-1 if the dedicated model "
+            "finds nothing."
+        ),
+    )
+    parser.add_argument(
+        "--ball_det_conf", type=float, default=0.25,
+        help=(
+            "Confidence threshold for the dedicated ball detector "
+            "(--ball_det_model, default: 0.25).  Ignored when --ball_det_model "
+            "is not set."
+        ),
+    )
+    parser.add_argument(
         "--codec", default="mp4v",
         help=(
             "FourCC video codec for the output file (default: mp4v). "
@@ -575,6 +597,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ball_cotracker_checkpoint=args.cotracker_checkpoint,
         ball_cotracker_device=args.device,
         ball_cotracker_redetect_interval=args.ball_ct_redetect,
+        ball_det_model_path=args.ball_det_model,
+        ball_det_conf=args.ball_det_conf,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))

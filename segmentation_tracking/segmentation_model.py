@@ -226,6 +226,18 @@ class SegmentationTracker:
     ball_cotracker_redetect_interval:
         Number of YOLO-confirmed ball detections between forced CoTracker3
         re-anchors.  Default ``15``.
+    ball_det_model_path:
+        Optional path to a dedicated ONNX ball-detection model (e.g.
+        ``"weights/yolov26_ball_det.onnx"``).  When provided this model is
+        used for **all** ball detection passes (global stage-1 and ROI
+        stage-2) in place of the main YOLO model.  The main YOLO result is
+        kept as a fallback for the global pass if the dedicated model finds
+        nothing.  The dedicated model is expected to output class ``0`` as
+        the ball class (single-class detector).  Loaded lazily via
+        ``ultralytics.YOLO`` which natively supports ``.onnx`` files.
+    ball_det_conf:
+        Confidence threshold for the dedicated ball detector (global pass).
+        Default ``0.25``.  Ignored when *ball_det_model_path* is *None*.
     """
 
     def __init__(
@@ -249,6 +261,8 @@ class SegmentationTracker:
         ball_cotracker_checkpoint: str | None = None,
         ball_cotracker_device: str = "cuda",
         ball_cotracker_redetect_interval: int = 15,
+        ball_det_model_path: str | None = None,
+        ball_det_conf: float = 0.25,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -261,8 +275,11 @@ class SegmentationTracker:
         self.use_homography = use_homography
         self.ball_conf_threshold = ball_conf_threshold
         self.ball_conf_roi = ball_conf_roi
+        self.ball_det_model_path = ball_det_model_path
+        self.ball_det_conf = ball_det_conf
 
-        self._detector = None                # lazy-loaded YOLO model
+        self._detector = None                # lazy-loaded main YOLO model
+        self._ball_det = None                # lazy-loaded dedicated ball YOLO/ONNX model
         self._sam = None                     # lazy-loaded SAM2VideoPredictor
         self._next_player_id: int = 1
 
@@ -319,6 +336,58 @@ class SegmentationTracker:
             logger.info("Loading YOLO detection model: %s", self.det_model_path)
             self._detector = YOLO(self.det_model_path)
         return self._detector
+
+    def _get_ball_detector(self):
+        """Return the dedicated ball detector (ONNX or YOLO model).
+
+        Loads ``self.ball_det_model_path`` lazily on first call via
+        ``ultralytics.YOLO`` (which supports ``.onnx`` exports natively).
+        Returns *None* when no dedicated model path was configured.
+        """
+        if self.ball_det_model_path is None:
+            return None
+        if self._ball_det is None:
+            from ultralytics import YOLO
+            logger.info(
+                "Loading dedicated ball detection model: %s",
+                self.ball_det_model_path,
+            )
+            self._ball_det = YOLO(self.ball_det_model_path)
+        return self._ball_det
+
+    def _detect_ball_with_dedicated(
+        self,
+        frame: np.ndarray,
+        conf: float,
+    ) -> np.ndarray | None:
+        """Run the dedicated ball detector on *frame*.
+
+        The dedicated model is expected to be a single-class detector with
+        class ``0`` = ball.  Returns the ``[x1, y1, x2, y2]`` bbox of the
+        highest-confidence detection, or *None* if nothing is found.
+        """
+        det = self._get_ball_detector()
+        if det is None:
+            return None
+        try:
+            results = det.predict(
+                frame,
+                conf=conf,
+                verbose=False,
+            )
+        except Exception as exc:
+            logger.debug("Dedicated ball detector failed: %s", exc)
+            return None
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+            return None
+        best_conf = -1.0
+        best_bbox: np.ndarray | None = None
+        for box in results[0].boxes:
+            c = float(box.conf[0].item())
+            if c > best_conf:
+                best_bbox = box.xyxy[0].cpu().numpy().astype(np.float32)
+                best_conf = c
+        return best_bbox
 
     def _get_sam_predictor(self):
         """Return an initialised SAM2VideoPredictor instance."""
@@ -470,12 +539,15 @@ class SegmentationTracker:
         if roi.size == 0:
             return None
 
-        det = self._get_detector()
+        det = self._get_ball_detector() or self._get_detector()
+        # When using a dedicated ball model (single-class), class 0 is the ball.
+        # When falling back to the main YOLO model, class 32 (COCO sports ball) is needed.
+        classes_filter = [0] if self._get_ball_detector() is not None else [_BALL_CLS]
         try:
             results = det.predict(
                 roi,
                 conf=self.ball_conf_roi,
-                classes=[_BALL_CLS],
+                classes=classes_filter,
                 verbose=False,
             )
         except Exception as exc:
@@ -936,8 +1008,16 @@ class SegmentationTracker:
                         ball_bbox = roi_bbox   # use for mask ellipse size
                         seg_result.ball_source = "roi"
                     else:
-                        # Stage 3: MOSSE search / velocity extrapolation
-                        cx, cy = self._ball_tracker.predict(frame)
+                        # Stage 3: MOSSE search / velocity extrapolation.
+                        # For CoTracker3 tracker pass player bboxes so it can
+                        # reject positions that drifted onto a player's foot.
+                        if isinstance(self._ball_tracker, BallCoTrackerTracker):
+                            cx, cy = self._ball_tracker.predict(
+                                frame,
+                                player_bboxes=seg_result.player_bboxes or None,
+                            )
+                        else:
+                            cx, cy = self._ball_tracker.predict(frame)
                         seg_result.ball_source = self._ball_tracker.last_source
 
         if cx is not None and cy is not None:
@@ -1033,8 +1113,19 @@ class SegmentationTracker:
             if self.use_homography and prev_frame is not None:
                 homography = self._estimate_homography(prev_frame, frame)
 
-            # BoT-SORT tracking + ball detection
+            # BoT-SORT tracking + ball detection (from main YOLO)
             bot_tracks, ball_bbox_raw = self._track_frame(frame)
+
+            # Dedicated ball detector (YOLOv26 ONNX or similar).
+            # Run in addition to the main YOLO call; preferred over the main
+            # YOLO result when it finds a detection.  Falls back to the main
+            # YOLO result if dedicated model returns nothing.
+            if self.ball_det_model_path is not None:
+                dedicated_bbox = self._detect_ball_with_dedicated(
+                    frame, self.ball_det_conf
+                )
+                if dedicated_bbox is not None:
+                    ball_bbox_raw = dedicated_bbox
 
             # SAM2 masks for this frame
             if frame_idx < len(sam_results_all):
