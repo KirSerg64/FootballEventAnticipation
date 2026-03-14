@@ -18,7 +18,7 @@ env/
 # Model weights (large files)
 *.pt
 *.pth
-*.onnx
+# *.onnx
 *.engine
 
 # Output directory (generated artifacts)
@@ -32,3 +32,5 @@ output/
 EXPLORATION_SUMMARY.txt
 REPOSITORY_EXPLORATION.md
 CODE_EXAMPLES.md
+data/
+.github
