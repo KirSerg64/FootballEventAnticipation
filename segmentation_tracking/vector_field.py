@@ -562,6 +562,11 @@ class _CoTrackerState:
                 queries=self._queries if not self._initialized else None,
             )
 
+        # CoTracker3 online returns None during warm-up (the sliding-window
+        # predictor hasn't accumulated enough frames to fire yet).
+        if pred_tracks is None:
+            return False
+
         # pred_tracks: (1, T, N, 2) — take positions at the last frame
         last_pos = pred_tracks[0, -1].cpu().numpy()  # (N, 2)
         self.positions = {
@@ -597,6 +602,10 @@ class _CoTrackerState:
 
         with torch.no_grad():
             pred_tracks, _ = self._predictor(video, queries=queries_t0)
+
+        # Guard: offline model can also return None on empty/degenerate inputs.
+        if pred_tracks is None:
+            return False
 
         # pred_tracks: (1, T, N, 2) — take positions at the last frame
         last_pos = pred_tracks[0, -1].cpu().numpy()  # (N, 2)
