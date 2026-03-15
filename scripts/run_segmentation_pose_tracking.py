@@ -57,6 +57,7 @@ Optional flags::
     --ball_ct_redetect   15               CoTracker ball: YOLO re-anchor interval (frames)
     --ball_det_model     None             Dedicated ball detection model (ONNX/YOLO, e.g. weights/yolov26_ball_det.onnx)
     --ball_det_conf      0.25            Confidence threshold for the dedicated ball detector
+    --no_attractor_use_ball              Disable ball-centric attractor (revert to pure vector-field mode)
     --codec              mp4v             FourCC codec for the output video
 """
 
@@ -191,11 +192,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--show_attractor", action="store_true",
         help=(
-            "Draw per-player velocity arrows and the vector-field attractor — the point "
-            "that all player velocity rays collectively converge towards, which estimates "
-            "the ball position.  Displayed as a colour-coded diamond marker."
+            "Draw per-player velocity arrows and the action-focus attractor.  "
+            "When ball detection is reliable (default), the attractor IS the ball "
+            "position (shown as a gold crosshair target) and player velocity arrows "
+            "are still drawn to visualise team pressure.  When the ball is lost the "
+            "attractor falls back to the velocity-field convergence estimate "
+            "(diamond marker).  Use --no_attractor_use_ball to disable the ball-centric "
+            "mode and always show the velocity-field estimate."
         ),
     )
+    parser.add_argument(
+        "--no_attractor_use_ball", action="store_false", dest="attractor_use_ball",
+        help=(
+            "Disable ball-centric attractor mode.  When set, the attractor always "
+            "uses the vector-field convergence estimate (old behaviour) even when "
+            "ball detection is available.  Useful for comparing both modes."
+        ),
+    )
+    parser.set_defaults(attractor_use_ball=True)
     parser.add_argument(
         "--attractor_history", type=int, default=5,
         help=(
@@ -769,20 +783,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
             # Prefer the ball when detected; fall back to the previous smoothed
             # attractor position to avoid losing the weighting on missed frames.
             anchor_pt: tuple[float, float] | None = None
+            ball_center_pt: tuple[float, float] | None = None
             if ball_track is not None:
                 anchor_pt = ball_track.center
+                if args.attractor_use_ball:
+                    ball_center_pt = ball_track.center
             elif _prev_attractor_pt is not None:
                 anchor_pt = _prev_attractor_pt
 
             raw_attractor = estimate_attractor(
                 direction_vectors,
                 frame_shape=(frame_h, frame_w),
+                # Ball-centric fast-path: when ball is detected and
+                # --attractor_use_ball is set (default), the expensive
+                # vector-field computation is bypassed and the exact ball
+                # position is returned with confidence=1.0.
+                ball_center=ball_center_pt,
                 anchor_point=anchor_pt,
                 distance_sigma=args.attractor_dist_sigma,
                 directional_weight=args.attractor_directional,
             )
 
-            # Apply Kalman smoother (or use raw directly if smoothing disabled)
+            # Apply Kalman smoother (or use raw directly if smoothing disabled).
+            # Ball-sourced estimates pass through without Kalman lag.
             if attractor_smoother is not None:
                 attractor = attractor_smoother.update(
                     raw_attractor, frame_shape=(frame_h, frame_w)

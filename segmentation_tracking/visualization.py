@@ -70,6 +70,10 @@ _ATTRACTOR_HI_COLOR = (0, 255, 200)    # high-confidence → bright cyan-green
 _ATTRACTOR_LO_COLOR = (0, 130, 255)    # low-confidence  → orange-yellow
 _VECTOR_ALPHA       = 0.70             # opacity of velocity arrows
 
+# Ball-centric action-focus marker (source="ball"): golden crosshair/target
+_BALL_FOCUS_COLOR   = (0, 200, 255)    # gold / amber (BGR)
+_BALL_FOCUS_RING_COLOR = (0, 165, 255) # slightly deeper amber for the outer ring
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour helpers
@@ -627,6 +631,90 @@ class Visualizer:
         canvas: np.ndarray,
         attractor: AttractorEstimate,
     ) -> None:
+        """Draw the attractor marker with style matching its *source*.
+
+        * ``source="ball"`` — gold concentric-ring crosshair labelled
+          **"Action Focus [BALL]"**.  Player velocity arrows already show team
+          pressure; this marker pins the confirmed ball position.
+
+        * ``source="vector_field"`` — confidence-coloured diamond (original
+          style), labelled **"Attractor"**.
+
+        * ``source="held"`` — dashed diamond outline (stale hold), as before.
+
+        Parameters
+        ----------
+        canvas:
+            BGR frame to annotate in-place.
+        attractor:
+            :class:`~segmentation_tracking.vector_field.AttractorEstimate`.
+        """
+        source = getattr(attractor, "source", "vector_field")
+        if source == "ball":
+            self._draw_ball_focus(canvas, attractor)
+        else:
+            self._draw_vf_attractor(canvas, attractor)
+
+    def _draw_ball_focus(
+        self,
+        canvas: np.ndarray,
+        attractor: AttractorEstimate,
+    ) -> None:
+        """Draw the ball-centric action-focus marker (gold crosshair / target).
+
+        Replaces the vector-field diamond when ``attractor.source == "ball"``.
+        Uses concentric rings + crosshair lines that visually communicate
+        "this is where the action is and the ball is confirmed here".
+        """
+        ax, ay = int(attractor.point[0]), int(attractor.point[1])
+        inner_r = 14
+        outer_r = 22
+        cross_len = outer_r + 10
+        color = _BALL_FOCUS_COLOR
+        ring_color = _BALL_FOCUS_RING_COLOR
+
+        overlay = canvas.copy()
+
+        # Outer ring (filled, semi-transparent)
+        cv2.circle(overlay, (ax, ay), outer_r, color, -1)
+        # Inner ring cutout (draw background colour to simulate a ring)
+        cv2.circle(overlay, (ax, ay), inner_r, (0, 0, 0), -1)
+        # Centre dot
+        cv2.circle(overlay, (ax, ay), 4, color, -1)
+
+        blended = cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0)
+        canvas[:] = blended
+
+        # Outer ring outline
+        cv2.circle(canvas, (ax, ay), outer_r, ring_color, 2, cv2.LINE_AA)
+        cv2.circle(canvas, (ax, ay), inner_r, ring_color, 1, cv2.LINE_AA)
+
+        # Crosshair lines (north-south, east-west)
+        gap = inner_r + 2
+        cv2.line(canvas, (ax, ay - cross_len), (ax, ay - gap), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax, ay + gap), (ax, ay + cross_len), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax - cross_len, ay), (ax - gap, ay), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax + gap, ay), (ax + cross_len, ay), color, 2, cv2.LINE_AA)
+
+        # Label
+        label = "Action Focus [BALL]"
+        lx = ax + outer_r + 6
+        ly = ay - 4
+        (tw, th), bl = cv2.getTextSize(label, _LABEL_FONT, 0.50, 1)
+        cv2.rectangle(
+            canvas,
+            (lx - 2, ly - th - 2),
+            (lx + tw + 2, ly + bl + 2),
+            (20, 20, 20),
+            cv2.FILLED,
+        )
+        cv2.putText(canvas, label, (lx, ly), _LABEL_FONT, 0.50, color, 1, cv2.LINE_AA)
+
+    def _draw_vf_attractor(
+        self,
+        canvas: np.ndarray,
+        attractor: AttractorEstimate,
+    ) -> None:
         """Draw the vector-field attractor as a diamond marker with a label.
 
         The marker colour interpolates between :data:`_ATTRACTOR_LO_COLOR`
@@ -704,9 +792,9 @@ class Visualizer:
         # Centre dot
         cv2.circle(canvas, (ax, ay), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
-        # Label
+        # Label — distinguish VF attractor from ball-sourced action focus
         held_tag = f" [HELD:{stale_frames}f]" if is_held else ""
-        label1 = f"Attractor (conf={conf:.2f}){held_tag}"
+        label1 = f"Attractor [VF] (conf={conf:.2f}){held_tag}"
         label2 = f"n={attractor.n_players}  spd={attractor.mean_speed:.1f}px/f"
         lx = ax + r + 6
         ly = ay - 4

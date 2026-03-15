@@ -168,6 +168,14 @@ class AttractorEstimate:
     mean_speed: float
     is_held: bool = False
     stale_frames: int = 0
+    source: str = "vector_field"
+    """Origin of this estimate.
+
+    * ``"ball"``         – position taken directly from reliable ball detection.
+    * ``"vector_field"`` – computed from player velocity/acceleration rays.
+    * ``"held"``         – Kalman smoother is predicting without a new raw
+                          estimate (see :class:`AttractorSmoother`).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1163,8 @@ def estimate_attractor(
     frame_shape: tuple[int, int] | None = None,
     # backward-compat alias kept for existing callers
     min_speed: float | None = None,
+    # Ball-centric fast-path (new)
+    ball_center: tuple[float, float] | None = None,
     # Distance and directional weighting (new)
     anchor_point: tuple[float, float] | None = None,
     distance_sigma: float = 0.0,
@@ -1162,6 +1172,17 @@ def estimate_attractor(
     min_weight_floor: float = 0.05,
 ) -> AttractorEstimate | None:
     """Estimate the vector-field attractor from player direction rays.
+
+    **Ball-centric fast-path** (new behaviour when ball is reliably detected):
+    When *ball_center* is provided, the expensive O(N) least-squares
+    intersection computation is **skipped entirely** and the ball position is
+    returned directly with ``confidence=1.0`` and ``source="ball"``.  Player
+    velocity arrows are still drawn by the pipeline; only the convergence
+    estimate is replaced by the authoritative measurement.  This is both
+    faster (O(1) instead of O(N)) and more accurate.
+
+    When *ball_center* is *None*, the function falls back to the original
+    vector-field estimation (unchanged behaviour).
 
     Works for *both* velocity-mode and acceleration-mode inputs.  In velocity
     mode the input is the output of :meth:`PlayerVelocityTracker.update`; in
@@ -1203,6 +1224,12 @@ def estimate_attractor(
         callers that used the original ``velocities``/``min_speed`` API.
         Use *min_magnitude* for new code.  If both are supplied, *min_speed*
         takes precedence.
+    ball_center:
+        When provided, the function immediately returns this position as the
+        attractor with ``confidence=1.0`` and ``source="ball"``, bypassing the
+        vector-field computation entirely.  Set to ``ball_track.center`` when
+        ball detection is reliable.  Defaults to *None* (legacy vector-field
+        mode).
     anchor_point:
         Optional ``(x, y)`` pixel coordinate used as the reference for
         distance and directional weighting.  Typically set to the current
@@ -1229,10 +1256,31 @@ def estimate_attractor(
     AttractorEstimate | None
         *None* when insufficient data is available or the linear system is
         numerically degenerate (all direction vectors nearly parallel).
+        When *ball_center* is provided, always returns a valid estimate.
     """
     # Backward-compat: honour the old keyword argument name
     if min_speed is not None:
         min_magnitude = min_speed
+
+    # ── Ball-centric fast-path ────────────────────────────────────────────────
+    # When ball detection is reliable the ball position is authoritative —
+    # return it directly without touching the O(N) vector-field computation.
+    if ball_center is not None:
+        bx, by = float(ball_center[0]), float(ball_center[1])
+        if frame_shape is not None:
+            fh, fw = frame_shape
+            bx = float(np.clip(bx, 0, fw - 1))
+            by = float(np.clip(by, 0, fh - 1))
+        logger.debug(
+            "Attractor: ball-centric fast-path (%.0f, %.0f)", bx, by
+        )
+        return AttractorEstimate(
+            point=(bx, by),
+            confidence=1.0,
+            n_players=0,
+            mean_speed=0.0,
+            source="ball",
+        )
 
     # Collect rays with sufficient magnitude
     origins: list[np.ndarray] = []
@@ -1333,6 +1381,7 @@ def estimate_attractor(
         confidence=confidence,
         n_players=n,
         mean_speed=mean_speed,
+        source="vector_field",
     )
 
 
@@ -1423,6 +1472,13 @@ class AttractorSmoother:
     ) -> AttractorEstimate | None:
         """Apply one Kalman filter step and return the smoothed estimate.
 
+        **Ball-source pass-through**: when *raw* has ``source="ball"`` (i.e.
+        the attractor position comes directly from reliable ball detection),
+        the Kalman filter is used only to update internal state (velocity
+        estimate) and the **exact** ball position is returned without the
+        Kalman lag.  This avoids adding artificial smoothing delay to a
+        measurement that is already precise.
+
         Parameters
         ----------
         raw:
@@ -1439,9 +1495,50 @@ class AttractorSmoother:
             ``max_stale_frames``.
         """
         if raw is not None:
-            # ── New measurement available ─────────────────────────────────
             z = np.array([raw.point[0], raw.point[1]], dtype=np.float64)
 
+            # ── Ball-centric fast-path: keep Kalman state in sync but return
+            #    the exact measurement without Kalman lag ─────────────────────
+            if raw.source == "ball":
+                if self._x is None:
+                    self._x = np.array([z[0], z[1], 0.0, 0.0], dtype=np.float64)
+                    self._P = np.diag([
+                        self._r ** 2,
+                        self._r ** 2,
+                        (self._q * 5) ** 2,
+                        (self._q * 5) ** 2,
+                    ]).astype(np.float64)
+                else:
+                    # Update Kalman with ball position so velocity estimate
+                    # stays valid when ball is later lost (fallback to VF mode)
+                    self._x = self._F @ self._x
+                    self._P = self._F @ self._P @ self._F.T + self._Q
+                    y = z - self._H @ self._x
+                    S = self._H @ self._P @ self._H.T + self._R
+                    K = self._P @ self._H.T @ np.linalg.inv(S)
+                    self._x = self._x + K @ y
+                    self._P = (self._I4 - K @ self._H) @ self._P
+
+                self._stale_frames = 0
+                self._last_raw = raw
+
+                # Return exact ball position — no Kalman lag
+                bx, by = float(raw.point[0]), float(raw.point[1])
+                if frame_shape is not None:
+                    fh, fw = frame_shape
+                    bx = float(np.clip(bx, 0, fw - 1))
+                    by = float(np.clip(by, 0, fh - 1))
+                return AttractorEstimate(
+                    point=(bx, by),
+                    confidence=1.0,
+                    n_players=0,
+                    mean_speed=0.0,
+                    is_held=False,
+                    stale_frames=0,
+                    source="ball",
+                )
+
+            # ── New vector-field measurement available ─────────────────────
             if self._x is None:
                 # First initialisation
                 self._x = np.array([z[0], z[1], 0.0, 0.0], dtype=np.float64)
@@ -1502,6 +1599,14 @@ class AttractorSmoother:
         stale_factor = max(0.0, 1.0 - self._stale_frames / self._max_stale)
         confidence = float(base_conf * stale_factor) if self._stale_frames > 0 else base_conf
 
+        # Propagate source: held estimates keep the last raw source
+        last_src = (
+            self._last_raw.source
+            if self._last_raw is not None
+            else "vector_field"
+        )
+        out_source = (raw.source if raw is not None else "held") if self._stale_frames == 0 else "held"
+
         return AttractorEstimate(
             point=(sx, sy),
             confidence=confidence,
@@ -1509,4 +1614,5 @@ class AttractorSmoother:
             mean_speed=raw.mean_speed if raw is not None else 0.0,
             is_held=(self._stale_frames > 0),
             stale_frames=self._stale_frames,
+            source=out_source,
         )
