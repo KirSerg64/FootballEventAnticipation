@@ -555,12 +555,29 @@ class _CoTrackerState:
             torch.stack(chunk_frames, dim=0).unsqueeze(0).to(self._device)
         )
 
-        with torch.no_grad():
-            pred_tracks, _ = self._predictor(
-                video_chunk,
-                is_first_step=not self._initialized,
-                queries=self._queries if not self._initialized else None,
+        try:
+            with torch.no_grad():
+                pred_tracks, _ = self._predictor(
+                    video_chunk,
+                    is_first_step=not self._initialized,
+                    queries=self._queries if not self._initialized else None,
+                )
+        except RuntimeError:
+            # CoTracker3's internal `coords_prev` can end up with an empty
+            # time dimension (shape [B, 0, N, 2]) when the set of tracked
+            # query points changes between detection cycles.  The subsequent
+            # `.expand(-1, step, -1, -1)` call inside the model then raises
+            # a RuntimeError because 0 cannot be broadcast to `step`.
+            # Force a full re-initialisation: discard the stale frame buffer
+            # so the next cycle starts from a clean sliding-window state.
+            logger.debug(
+                "CoTracker3 online RuntimeError (likely stale coords_prev); "
+                "resetting frame buffer for clean re-initialisation."
             )
+            self._initialized = False
+            self._frame_buf = []
+            self._pending = 0
+            return False
 
         # CoTracker3 online returns None during warm-up (the sliding-window
         # predictor hasn't accumulated enough frames to fire yet).
@@ -1266,6 +1283,64 @@ def estimate_attractor(
         *None* when insufficient data is available or the linear system is
         numerically degenerate (all direction vectors nearly parallel).
         When *ball_center* is provided, always returns a valid estimate.
+
+    Examples
+    --------
+    **Ball-centric fast-path** — use when the ball tracker is reliable:
+
+    .. code-block:: python
+
+        from segmentation_tracking.vector_field import estimate_attractor
+
+        # Ball position from DCF / CoTracker / YOLOv8 detector (x, y pixels)
+        ball_xy = (640.0, 520.0)
+
+        # Player velocity vectors: {id: (cx, cy, vx, vy)}
+        velocities = {
+            1: (300.0, 400.0,  8.5,  3.2),
+            2: (500.0, 350.0, -6.0,  4.1),
+            3: (700.0, 480.0,  2.0, -7.8),
+        }
+
+        # Fast-path: ball position is returned directly, O(N) skipped.
+        attractor = estimate_attractor(velocities, ball_center=ball_xy)
+        # attractor.point == (640.0, 520.0)
+        # attractor.confidence == 1.0
+        # attractor.source == "ball"
+
+    **Vector-field mode** with distance + directional weighting:
+
+    .. code-block:: python
+
+        prev_attractor = (620.0, 510.0)   # smoothed estimate from last frame
+
+        attractor = estimate_attractor(
+            velocities,
+            min_magnitude=1.5,
+            min_players=2,
+            frame_shape=(1080, 1920),     # clamp to frame boundaries
+            anchor_point=prev_attractor,  # weight players near the action
+            distance_sigma=200.0,         # Gaussian σ in pixels
+            directional_weight=True,      # favour players moving toward anchor
+            min_weight_floor=0.05,        # small baseline for retreating players
+        )
+        if attractor is not None:
+            print(attractor.point, attractor.confidence, attractor.source)
+
+    **Combined pipeline** — ball-centric when available, vector-field fallback:
+
+    .. code-block:: python
+
+        # `ball_track` is a BallDCFTracker / BallCoTrackerTracker result object
+        # with a `center` attribute (x, y) and an `is_reliable` flag.
+        ball_center = ball_track.center if ball_track is not None else None
+        attractor = estimate_attractor(
+            velocities,
+            ball_center=ball_center,       # None → falls back to vector-field
+            anchor_point=ball_center or prev_attractor,
+            distance_sigma=200.0,
+            directional_weight=True,
+        )
     """
     # Backward-compat: honour the old keyword argument name
     if min_speed is not None:
