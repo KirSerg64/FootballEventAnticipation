@@ -59,6 +59,18 @@ Optional flags::
     --ball_det_conf      0.25            Confidence threshold for the dedicated ball detector
     --no_attractor_use_ball              Disable ball-centric attractor (revert to pure vector-field mode)
     --codec              mp4v             FourCC codec for the output video
+
+Player-only tracking (out-of-the-box, no custom model required)::
+
+    --player_class_ids   0               Comma-separated YOLO class IDs to treat as players (default: 0 = COCO person).
+                                          Use with a sport-specific model to exclude referees:
+                                          e.g. --player_class_ids 0,1 (player + goalkeeper, not referee=2).
+    --field_mask_filter                  Enable green-grass HSV field mask to discard off-pitch persons
+                                          (spectators, coaches, camera operators). Zero training required.
+    --field_hsv_lo       36,40,40        HSV lower bound for field mask (H,S,V in OpenCV scale)
+    --field_hsv_hi       85,255,255      HSV upper bound for field mask
+    --field_min_overlap  0.3             Min fraction of bbox foot-region on green pixels to keep the person
+    --field_mask_interval 15             Recompute field mask every N frames
 """
 
 from __future__ import annotations
@@ -464,6 +476,62 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Use 'avc1' for H.264 if supported by your OpenCV build."
         ),
     )
+    # ── Player-only tracking ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--player_class_ids", default="0",
+        help=(
+            "Comma-separated YOLO class IDs to treat as players (default: '0' = "
+            "COCO person class).  Use this when you supply a sport-specific YOLO "
+            "model that distinguishes players from referees.  For example, with a "
+            "Roboflow football model that uses 0=player, 1=goalkeeper, 2=referee "
+            "you can pass '--player_class_ids 0,1' to track players and goalkeepers "
+            "but skip referees.  The ball class is managed separately and is not "
+            "affected by this setting."
+        ),
+    )
+    parser.add_argument(
+        "--field_mask_filter", action="store_true",
+        help=(
+            "Enable green-grass HSV field mask filtering.  When active, a colour "
+            "segmentation mask of the playing field is derived from each frame and "
+            "used to discard person detections whose feet are not on the grass — "
+            "eliminating spectators in the stands, coaches on the bench, camera "
+            "operators, and other off-pitch persons.  No custom model or training is "
+            "required.  Combine with --field_hsv_lo / --field_hsv_hi to tune the "
+            "HSV range for artificial turf or unusual lighting conditions."
+        ),
+    )
+    parser.add_argument(
+        "--field_hsv_lo", default="36,40,40",
+        help=(
+            "HSV lower bound for the field mask as 'H,S,V' (OpenCV scale: "
+            "H∈[0,180], S/V∈[0,255]; default: '36,40,40').  Used only when "
+            "--field_mask_filter is set."
+        ),
+    )
+    parser.add_argument(
+        "--field_hsv_hi", default="85,255,255",
+        help=(
+            "HSV upper bound for the field mask as 'H,S,V' (default: '85,255,255'). "
+            "Used only when --field_mask_filter is set."
+        ),
+    )
+    parser.add_argument(
+        "--field_min_overlap", type=float, default=0.3,
+        help=(
+            "Minimum fraction of the bounding-box foot region that must fall on "
+            "green pixels to keep a tracked person (default: 0.3).  Lower values "
+            "retain players near the sideline; higher values are more aggressive."
+        ),
+    )
+    parser.add_argument(
+        "--field_mask_interval", type=int, default=15,
+        help=(
+            "Recompute the field mask every N frames (default: 15).  "
+            "Lower values adapt faster to camera panning or lighting changes; "
+            "higher values are faster.  Used only when --field_mask_filter is set."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -613,6 +681,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ball_cotracker_redetect_interval=args.ball_ct_redetect,
         ball_det_model_path=args.ball_det_model,
         ball_det_conf=args.ball_det_conf,
+        player_class_ids=[int(x) for x in args.player_class_ids.split(",") if x.strip()],
+        field_mask_filter=args.field_mask_filter,
+        field_hsv_lo=tuple(int(x) for x in args.field_hsv_lo.split(",")),  # type: ignore[arg-type]
+        field_hsv_hi=tuple(int(x) for x in args.field_hsv_hi.split(",")),  # type: ignore[arg-type]
+        field_min_overlap=args.field_min_overlap,
+        field_mask_interval=args.field_mask_interval,
     )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))

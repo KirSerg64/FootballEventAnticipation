@@ -75,6 +75,19 @@ logger = logging.getLogger(__name__)
 _PERSON_CLS = 0
 _BALL_CLS = 32  # sports ball
 
+# -- Field-mask filter constants ----------------------------------------------
+# Default HSV range for detecting green grass on a football pitch.
+# Hue is in OpenCV range [0, 180]; adjust for artificial turf or unusual
+# lighting by passing custom values via the field_hsv_lo / field_hsv_hi
+# constructor parameters.
+_DEFAULT_FIELD_HSV_LO: tuple[int, int, int] = (36, 40, 40)
+_DEFAULT_FIELD_HSV_HI: tuple[int, int, int] = (85, 255, 255)
+# Morphological structuring-element size and iteration counts used when
+# cleaning the raw HSV mask.  CLOSE fills small holes; OPEN removes noise.
+_FIELD_MASK_MORPH_SIZE: int = 15
+_FIELD_MASK_MORPH_CLOSE_ITERS: int = 3
+_FIELD_MASK_MORPH_OPEN_ITERS: int = 2
+
 # -- Homography estimation constants -----------------------------------------
 # Number of ORB keypoints to detect per frame for camera-motion estimation
 _ORB_N_FEATURES = 500
@@ -106,6 +119,91 @@ _BYTETRACK_TEMPLATE = (
     "match_thresh: 0.8\n"
     "fuse_score: false\n"
 )
+
+
+# ---------------------------------------------------------------------------
+# Field-mask helpers
+# ---------------------------------------------------------------------------
+
+def _detect_field_mask(
+    frame: np.ndarray,
+    hsv_lo: tuple[int, int, int] = _DEFAULT_FIELD_HSV_LO,
+    hsv_hi: tuple[int, int, int] = _DEFAULT_FIELD_HSV_HI,
+) -> np.ndarray:
+    """Return a binary mask of the playing field using HSV green-range detection.
+
+    Converts *frame* to HSV, thresholds on the supplied hue/saturation/value
+    range (default: broad green band suitable for natural grass), then applies
+    morphological CLOSE + OPEN to produce a solid, hole-free field region.
+
+    Parameters
+    ----------
+    frame:
+        Full BGR video frame.
+    hsv_lo, hsv_hi:
+        Lower and upper HSV bounds ``(H, S, V)`` in OpenCV scale
+        (H ∈ [0, 180], S/V ∈ [0, 255]).
+
+    Returns
+    -------
+    np.ndarray
+        Binary uint8 mask (0/255), same spatial size as *frame*.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array(hsv_lo, dtype=np.uint8),
+        np.array(hsv_hi, dtype=np.uint8),
+    )
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_FIELD_MASK_MORPH_SIZE, _FIELD_MASK_MORPH_SIZE)
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=_FIELD_MASK_MORPH_CLOSE_ITERS)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=_FIELD_MASK_MORPH_OPEN_ITERS)
+    return mask
+
+
+def _bbox_on_field(
+    bbox: np.ndarray,
+    field_mask: np.ndarray,
+    min_overlap: float = 0.3,
+) -> bool:
+    """Return *True* if *bbox* has sufficient overlap with *field_mask*.
+
+    Only the **bottom half** of the bounding box (the feet/legs region) is
+    tested.  This avoids rejecting players near the sideline whose upper body
+    extends above the grass boundary, while still correctly excluding people
+    who are entirely off the pitch (e.g. spectators in the stands).
+
+    Parameters
+    ----------
+    bbox:
+        Bounding box ``[x1, y1, x2, y2]``.
+    field_mask:
+        Binary uint8 mask produced by :func:`_detect_field_mask`.
+    min_overlap:
+        Minimum fraction of the tested region that must be green for the
+        person to be considered on the field (default: 0.3).
+
+    Returns
+    -------
+    bool
+        *True* when the person is on (or sufficiently near) the playing field.
+    """
+    mh, mw = field_mask.shape
+    x1 = max(int(bbox[0]), 0)
+    y1 = max(int(bbox[1]), 0)
+    x2 = min(int(bbox[2]), mw - 1)
+    y2 = min(int(bbox[3]), mh - 1)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    # Restrict to the lower half of the bbox (feet region)
+    bh = y2 - y1
+    foot_y1 = y1 + bh // 2
+    region = field_mask[foot_y1:y2, x1:x2]
+    if region.size == 0:
+        return False
+    return float(np.count_nonzero(region)) / region.size >= min_overlap
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +336,33 @@ class SegmentationTracker:
     ball_det_conf:
         Confidence threshold for the dedicated ball detector (global pass).
         Default ``0.25``.  Ignored when *ball_det_model_path* is *None*.
+    player_class_ids:
+        YOLO class IDs to treat as **players** (default: ``[0]``, the COCO
+        person class).  When using a sport-specific YOLO model that labels
+        player, goalkeeper, and referee separately you can restrict tracking
+        to field players only — e.g. ``player_class_ids=[0, 1]`` to include
+        players and goalkeepers but exclude referees (class 2).  The ball
+        class is managed separately and is not affected by this setting.
+    field_mask_filter:
+        When *True*, a green-grass HSV mask is computed from each video frame
+        and used to discard person detections whose bounding box does not
+        overlap the field sufficiently.  This eliminates spectators in the
+        stands, coaches on the bench, camera operators, and other non-players
+        who happen to be detected near the field boundary.  Default *False*.
+    field_hsv_lo, field_hsv_hi:
+        Lower and upper HSV bounds ``(H, S, V)`` for the green-field mask
+        (OpenCV scale: H ∈ [0, 180], S/V ∈ [0, 255]).  Defaults work well
+        for natural grass under standard broadcast lighting.  Adjust for
+        artificial turf or unusual white-balance settings.
+    field_min_overlap:
+        Minimum fraction of the bounding-box foot region that must fall on
+        green pixels for a person to be kept.  Default ``0.3`` (30 %).
+        Lower values keep people closer to the sideline; higher values are
+        more aggressive at excluding off-field persons.
+    field_mask_interval:
+        Recompute the field mask every *N* frames (default: ``15``).  HSV
+        segmentation is cheap, but recomputing every frame is unnecessary
+        unless the camera is panning rapidly or lighting changes quickly.
     """
 
     def __init__(
@@ -263,6 +388,12 @@ class SegmentationTracker:
         ball_cotracker_redetect_interval: int = 15,
         ball_det_model_path: str | None = None,
         ball_det_conf: float = 0.25,
+        player_class_ids: list[int] | None = None,
+        field_mask_filter: bool = False,
+        field_hsv_lo: tuple[int, int, int] = _DEFAULT_FIELD_HSV_LO,
+        field_hsv_hi: tuple[int, int, int] = _DEFAULT_FIELD_HSV_HI,
+        field_min_overlap: float = 0.3,
+        field_mask_interval: int = 15,
     ) -> None:
         self.sam_model_path = sam_model_path
         self.det_model_path = det_model_path
@@ -277,6 +408,18 @@ class SegmentationTracker:
         self.ball_conf_roi = ball_conf_roi
         self.ball_det_model_path = ball_det_model_path
         self.ball_det_conf = ball_det_conf
+
+        # Player-only tracking
+        self._player_class_ids: list[int] = (
+            list(player_class_ids) if player_class_ids is not None else [_PERSON_CLS]
+        )
+        self.field_mask_filter = field_mask_filter
+        self.field_hsv_lo = field_hsv_lo
+        self.field_hsv_hi = field_hsv_hi
+        self.field_min_overlap = field_min_overlap
+        self.field_mask_interval = field_mask_interval
+        # Cached field mask (updated every field_mask_interval frames)
+        self._field_mask: np.ndarray | None = None
 
         self._detector = None                # lazy-loaded main YOLO model
         self._ball_det = None                # lazy-loaded dedicated ball YOLO/ONNX model
@@ -415,15 +558,15 @@ class SegmentationTracker:
     ) -> tuple[dict[int, np.ndarray], np.ndarray | None]:
         """Run one frame through BoT-SORT and detect the ball.
 
-        A single YOLO forward pass covers both person tracking (class 0)
-        and ball detection (class 32).  Person detections carry persistent
-        BoT-SORT IDs; ball detections are returned as a raw bbox (the
+        A single YOLO forward pass covers player tracking (``self._player_class_ids``)
+        and ball detection (class ``_BALL_CLS``).  Player detections carry
+        persistent BoT-SORT IDs; ball detections are returned as a raw bbox (the
         correlation tracker processes them in :meth:`_process_ball`).
 
         Returns
         -------
         player_tracks:
-            ``{track_id: bbox_float32}`` for each confirmed person track.
+            ``{track_id: bbox_float32}`` for each confirmed player track.
         ball_bbox:
             ``[x1, y1, x2, y2]`` for the highest-confidence ball detection,
             or *None*.
@@ -434,12 +577,15 @@ class SegmentationTracker:
         # its own track_high_thresh (= conf_threshold) for player track
         # creation/maintenance and is unaffected by the lower value.
         _eff_conf = min(self.conf_threshold, self.ball_conf_threshold)
+        # Build the combined class list: all player classes + ball class.
+        # Using a set avoids duplicates if someone mistakenly includes _BALL_CLS.
+        _classes = sorted(set(self._player_class_ids) | {_BALL_CLS})
         results = det.track(
             frame,
             persist=True,
             tracker=self._tracker_config_path,
             conf=_eff_conf,
-            classes=[_PERSON_CLS, _BALL_CLS],
+            classes=_classes,
             verbose=False,
         )
 
@@ -454,7 +600,7 @@ class SegmentationTracker:
                     cls = int(r.boxes.cls[i].item())
                     bbox = r.boxes.xyxy[i].cpu().numpy().astype(np.float32)
                     conf = float(r.boxes.conf[i].item())
-                    if cls == _PERSON_CLS:
+                    if cls in self._player_class_ids:
                         if r.boxes.id is not None and i < len(r.boxes.id):
                             tid = int(r.boxes.id[i].item())
                             player_tracks[tid] = bbox
@@ -471,10 +617,11 @@ class SegmentationTracker:
     ) -> tuple[list[np.ndarray], np.ndarray | None]:
         """Run YOLO predict (no tracker) and return (player_bboxes, ball_bbox)."""
         det = self._get_detector()
+        _classes = sorted(set(self._player_class_ids) | {_BALL_CLS})
         results = det.predict(
             frame,
             conf=self.conf_threshold,
-            classes=[_PERSON_CLS, _BALL_CLS],
+            classes=_classes,
             verbose=False,
         )[0]
 
@@ -486,7 +633,7 @@ class SegmentationTracker:
             cls = int(box.cls[0].item())
             conf = float(box.conf[0].item())
             xyxy = box.xyxy[0].cpu().numpy().astype(np.float32)
-            if cls == _PERSON_CLS:
+            if cls in self._player_class_ids:
                 player_bboxes.append(xyxy)
             elif cls == _BALL_CLS and conf > best_ball_conf:
                 ball_bbox = xyxy
@@ -772,6 +919,32 @@ class SegmentationTracker:
                 self._next_player_id += 1
 
         return assigned  # type: ignore[return-value]
+
+    # -- Field mask filtering -------------------------------------------------
+
+    def _apply_field_mask_filter(
+        self,
+        seg_result: SegmentationResult,
+    ) -> SegmentationResult:
+        """Remove tracked persons whose bounding box is not on the field.
+
+        Filters ``seg_result.player_ids``, ``player_masks``, and
+        ``player_bboxes`` in-place by testing each bbox against the cached
+        ``self._field_mask`` using :func:`_bbox_on_field`.
+
+        Returns *seg_result* unchanged if no field mask is available.
+        """
+        if self._field_mask is None:
+            return seg_result
+        keep = [
+            i
+            for i, bbox in enumerate(seg_result.player_bboxes)
+            if _bbox_on_field(bbox, self._field_mask, self.field_min_overlap)
+        ]
+        seg_result.player_ids = [seg_result.player_ids[i] for i in keep]
+        seg_result.player_masks = [seg_result.player_masks[i] for i in keep]
+        seg_result.player_bboxes = [seg_result.player_bboxes[i] for i in keep]
+        return seg_result
 
     # -- SAM2 helpers ---------------------------------------------------------
 
@@ -1062,6 +1235,7 @@ class SegmentationTracker:
         """
         self._next_player_id = 1
         self._ball_tracker.reset()
+        self._field_mask = None  # reset cached mask for new video
 
         # -- Read first frame -------------------------------------------------
         cap = cv2.VideoCapture(video_path)
@@ -1152,6 +1326,14 @@ class SegmentationTracker:
                 and frame_idx % self.redetect_interval == 0
             ):
                 seg_result = self._redetect_new_players(frame, seg_result, homography)
+
+            # Field mask filter: remove persons not on the grass pitch
+            if self.field_mask_filter:
+                if self._field_mask is None or frame_idx % self.field_mask_interval == 0:
+                    self._field_mask = _detect_field_mask(
+                        frame, self.field_hsv_lo, self.field_hsv_hi
+                    )
+                seg_result = self._apply_field_mask_filter(seg_result)
 
             # Ball correlation tracker (detection-first + MOSSE gap fill)
             seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
