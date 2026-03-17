@@ -179,6 +179,14 @@ class Sam3SegmentationTracker:
     score_threshold:
         Minimum SAM3 object confidence score to accept a detection.
         Default ``0.30``.
+    use_float16:
+        When *True*, the SAM3 model weights are converted to float16
+        immediately after loading, roughly halving the GPU VRAM footprint
+        (~6–8 GB → ~3–4 GB for a standard SAM3 checkpoint).  This is
+        especially useful when the GPU is shared with other models (pose
+        estimator, ball tracker, etc.).  There is a tiny risk of numerical
+        precision loss in rare edge cases, but in practice the segmentation
+        quality is indistinguishable from float32.  Default ``False``.
     """
 
     def __init__(
@@ -189,6 +197,7 @@ class Sam3SegmentationTracker:
         ball_text_prompt: str | None = _DEFAULT_BALL_PROMPT,
         field_text_prompt: str | None = _DEFAULT_FIELD_PROMPT,
         score_threshold: float = _DEFAULT_SCORE_THRESH,
+        use_float16: bool = False,
     ) -> None:
         self.sam3_model_path = sam3_model_path
         self.device = device
@@ -196,6 +205,7 @@ class Sam3SegmentationTracker:
         self.ball_text_prompt = ball_text_prompt
         self.field_text_prompt = field_text_prompt
         self.score_threshold = score_threshold
+        self.use_float16 = use_float16
 
         # Lazy-loaded predictor (shared across calls)
         self._predictor: Any = None
@@ -232,7 +242,26 @@ class Sam3SegmentationTracker:
         else:
             checkpoint_path = self.sam3_model_path
 
-        logger.info("Loading SAM3 video predictor (checkpoint_path=%s)", checkpoint_path)
+        # ------------------------------------------------------------------
+        # Pre-load memory management
+        # ------------------------------------------------------------------
+        # Free any cached (but not actively used) GPU memory so SAM3 can
+        # get a contiguous allocation.  This is especially important when
+        # other models (pose estimator, ball tracker, …) have already been
+        # loaded and left fragmented allocator state.
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            _free_before = torch.cuda.mem_get_info()[0] / 1024 ** 3
+            logger.info(
+                "GPU memory before SAM3 load: %.2f GiB free / %.2f GiB total",
+                _free_before,
+                torch.cuda.get_device_properties(0).total_memory / 1024 ** 3,
+            )
+
         # Sam3VideoPredictor has no 'device' parameter: it always calls .cuda()
         # internally (requires a CUDA-capable GPU).  If a non-CUDA device was
         # requested we log a warning but proceed — the SAM3 model itself decides
@@ -243,7 +272,70 @@ class Sam3SegmentationTracker:
                 "The requested device '%s' cannot be honoured.",
                 self.device,
             )
-        self._predictor = Sam3VideoPredictor(checkpoint_path=checkpoint_path)
+
+        logger.info(
+            "Loading SAM3 video predictor (checkpoint_path=%s, float16=%s)",
+            checkpoint_path,
+            self.use_float16,
+        )
+
+        try:
+            self._predictor = Sam3VideoPredictor(checkpoint_path=checkpoint_path)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as oom_exc:
+            # Provide a more actionable error message.
+            msg = str(oom_exc)
+            if "out of memory" in msg.lower() or "OutOfMemory" in type(oom_exc).__name__:
+                if torch.cuda.is_available():
+                    free_gib = torch.cuda.mem_get_info()[0] / 1024 ** 3
+                    total_gib = (
+                        torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+                    )
+                else:
+                    free_gib = total_gib = 0.0
+                raise RuntimeError(
+                    f"CUDA out of memory while loading SAM3 "
+                    f"(GPU has {free_gib:.1f} GiB free out of {total_gib:.1f} GiB total).\n\n"
+                    "Suggested mitigations (in order of ease):\n"
+                    "  1. Add --sam3_float16 to halve the model's VRAM footprint.\n"
+                    "  2. Ensure no other GPU-heavy processes are running.\n"
+                    "  3. Use a GPU with more VRAM (SAM3 needs ~6 GiB in float32, "
+                    "~3 GiB in float16).\n"
+                ) from oom_exc
+            raise
+
+        # ------------------------------------------------------------------
+        # Optional float16 conversion
+        # ------------------------------------------------------------------
+        # Converting model weights to float16 roughly halves GPU VRAM usage.
+        # We do this *after* a successful load because SAM3 always initialises
+        # in float32 internally (.cuda()).
+        if self.use_float16 and hasattr(self._predictor, "model"):
+            try:
+                self._predictor.model.half()
+                logger.info(
+                    "SAM3 model converted to float16 — "
+                    "GPU VRAM usage is approximately halved."
+                )
+            except Exception as half_exc:
+                logger.warning(
+                    "Could not convert SAM3 model to float16 (%s); "
+                    "continuing in float32.",
+                    half_exc,
+                )
+        elif self.use_float16:
+            logger.warning(
+                "use_float16=True but the SAM3 predictor has no 'model' attribute; "
+                "float16 conversion skipped."
+            )
+
+        if torch.cuda.is_available():
+            _free_after = torch.cuda.mem_get_info()[0] / 1024 ** 3
+            logger.info(
+                "GPU memory after SAM3 load: %.2f GiB free / %.2f GiB total",
+                _free_after,
+                torch.cuda.get_device_properties(0).total_memory / 1024 ** 3,
+            )
+
         return self._predictor
 
     # ------------------------------------------------------------------

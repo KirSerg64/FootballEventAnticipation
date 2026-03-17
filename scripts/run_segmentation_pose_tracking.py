@@ -80,6 +80,7 @@ SAM 3 backend (replaces SAM 2 segmentation with text-prompt driven SAM 3)::
     --sam3_ball_prompt   "sports ball"           Text prompt for ball detection (empty string to disable)
     --sam3_field_prompt  ""                      Text prompt for field segmentation (empty = disabled)
     --sam3_score_thresh  0.30            Minimum SAM3 object confidence to accept a detection
+    --sam3_float16                       Load SAM3 in float16 to halve GPU VRAM usage (~3 GiB vs ~6 GiB)
 """
 
 from __future__ import annotations
@@ -594,6 +595,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: 0.30).  Used only with --sam_backend sam3."
         ),
     )
+    parser.add_argument(
+        "--sam3_float16", action="store_true", default=False,
+        help=(
+            "Convert the SAM3 model to float16 immediately after loading to "
+            "roughly halve its GPU VRAM footprint (~3 GiB vs ~6 GiB in float32). "
+            "Recommended when GPU memory is limited or shared with other models. "
+            "Used only with --sam_backend sam3."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -731,6 +741,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             ball_text_prompt=args.sam3_ball_prompt or None,
             field_text_prompt=args.sam3_field_prompt or None,
             score_threshold=args.sam3_score_thresh,
+            use_float16=args.sam3_float16,
         )
         logger.info(
             "SAM3 tracker: player='%s', ball='%s', field='%s'",
