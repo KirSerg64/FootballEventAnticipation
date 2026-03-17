@@ -210,7 +210,7 @@ class Sam3SegmentationTracker:
             return self._predictor
 
         try:
-            from sam3.model_builder import build_sam3_video_predictor
+            from sam3.model.sam3_video_predictor import Sam3VideoPredictor
         except ImportError as exc:
             raise ImportError(
                 "The 'sam3' package is not installed.  Install it with:\n\n"
@@ -228,15 +228,22 @@ class Sam3SegmentationTracker:
                 "(may fail or use default pretrained weights).",
                 self.sam3_model_path,
             )
-            checkpoint = None
+            checkpoint_path = None
         else:
-            checkpoint = self.sam3_model_path
+            checkpoint_path = self.sam3_model_path
 
-        logger.info("Loading SAM3 video predictor (checkpoint=%s)", checkpoint)
-        self._predictor = build_sam3_video_predictor(
-            checkpoint=checkpoint,
-            device=self.device,
-        )
+        logger.info("Loading SAM3 video predictor (checkpoint_path=%s)", checkpoint_path)
+        # Sam3VideoPredictor has no 'device' parameter: it always calls .cuda()
+        # internally (requires a CUDA-capable GPU).  If a non-CUDA device was
+        # requested we log a warning but proceed — the SAM3 model itself decides
+        # where to place its weights.
+        if self.device != "cuda":
+            logger.warning(
+                "Sam3VideoPredictor always loads on CUDA internally. "
+                "The requested device '%s' cannot be honoured.",
+                self.device,
+            )
+        self._predictor = Sam3VideoPredictor(checkpoint_path=checkpoint_path)
         return self._predictor
 
     # ------------------------------------------------------------------
@@ -262,7 +269,7 @@ class Sam3SegmentationTracker:
 
         # -----------------------------------------------------------------
         # Try the high-level ``handle_request`` API first (preferred,
-        # available when using ``build_sam3_video_predictor``).
+        # available when using ``Sam3VideoPredictor``).
         # Fall back to the low-level ``init_state`` / ``propagate_in_video``
         # API exposed by ``Sam3VideoInference``.
         # -----------------------------------------------------------------
@@ -284,49 +291,107 @@ class Sam3SegmentationTracker:
         text_prompt: str,
         max_frames: int | None,
     ) -> dict[int, list[tuple[int, np.ndarray]]]:
-        """Use the ``handle_request`` request/response API."""
+        """Use the ``handle_request`` / ``handle_stream_request`` API.
+
+        API flow
+        --------
+        1. ``start_session``  → ``{"session_id": str}``
+        2. ``add_prompt``     → ``{"frame_index": int, "outputs": dict}``
+           where ``outputs`` is the ``obj_id_to_mask`` dict for frame 0.
+        3. ``propagate_in_video`` via ``handle_stream_request``
+           → generator of ``{"frame_index": int, "outputs": dict}``
+        4. ``close_session``
+        """
         logger.info(
             "SAM3 handle_request API: prompt='%s', video=%s", text_prompt, video_path
         )
 
-        # Start a new session
+        # 1. Start a new session
         start_resp = predictor.handle_request(
             request=dict(type="start_session", resource_path=video_path)
         )
         session_id = start_resp["session_id"]
 
-        # Add the text prompt at frame 0 — SAM3 propagates automatically
-        prompt_resp = predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=0,
-                text=text_prompt,
-            )
-        )
-
-        # The response may already contain per-frame outputs
-        raw_outputs: list[Any] = prompt_resp.get("outputs", [])
-
-        # Additionally pull frame-by-frame results when available
         result_map: dict[int, list[tuple[int, np.ndarray]]] = {}
-        self._process_raw_outputs(raw_outputs, result_map, max_frames)
-
-        # If the response bundles all frames, we're done; otherwise run propagation
-        if not result_map:
-            logger.debug("No outputs in add_prompt response; running propagation.")
-            prop_resp = predictor.handle_request(
+        try:
+            # 2. Add the text prompt at frame 0
+            prompt_resp = predictor.handle_request(
                 request=dict(
-                    type="propagate",
+                    type="add_prompt",
                     session_id=session_id,
-                    max_frames=max_frames,
+                    frame_index=0,
+                    text=text_prompt,
                 )
             )
-            self._process_raw_outputs(
-                prop_resp.get("outputs", []), result_map, max_frames
+            # add_prompt returns {"frame_index": N, "outputs": obj_id_to_mask_dict}
+            self._process_frame_output(prompt_resp, result_map, max_frames)
+
+            # 3. Propagate through the rest of the video using the streaming API.
+            #    handle_stream_request yields one dict per frame.
+            prop_request = dict(
+                type="propagate_in_video",
+                session_id=session_id,
+                propagation_direction="forward",
+                start_frame_index=1,         # frame 0 already handled above
+                max_frame_num_to_track=max_frames,
             )
+            for frame_out in predictor.handle_stream_request(request=prop_request):
+                self._process_frame_output(frame_out, result_map, max_frames)
+
+        finally:
+            # 4. Always close the session to free GPU memory
+            try:
+                predictor.handle_request(
+                    request=dict(type="close_session", session_id=session_id)
+                )
+            except Exception as close_exc:
+                logger.debug("close_session raised (ignored): %s", close_exc)
 
         return result_map
+
+    def _process_frame_output(
+        self,
+        frame_out: Any,
+        result_map: dict[int, list[tuple[int, np.ndarray]]],
+        max_frames: int | None,
+    ) -> None:
+        """Parse one ``{"frame_index": N, "outputs": obj_id_to_mask}`` item.
+
+        The ``outputs`` value may be either the ``obj_id_to_mask`` dict
+        directly, or a wrapper dict that contains it under the key
+        ``"obj_id_to_mask"``.  Both forms are handled.
+        """
+        if not isinstance(frame_out, dict):
+            return
+
+        frame_idx = frame_out.get("frame_index", frame_out.get("frame_idx"))
+        if frame_idx is None:
+            return
+        if max_frames is not None and int(frame_idx) >= max_frames:
+            return
+
+        outputs = frame_out.get("outputs", {})
+        # SAM3 may return outputs in two forms depending on the API version:
+        #   • Wrapped:  {"obj_id_to_mask": {id: mask}, "obj_id_to_score": {id: score}}
+        #   • Direct:   {id: mask}   (the obj_id_to_mask dict itself)
+        # Both are normalised below.
+        if isinstance(outputs, dict) and "obj_id_to_mask" in outputs:
+            obj_id_to_mask = outputs["obj_id_to_mask"]
+            obj_id_to_score = outputs.get("obj_id_to_score", {})
+        elif isinstance(outputs, dict):
+            obj_id_to_mask = outputs
+            obj_id_to_score = {}
+        else:
+            return
+
+        for obj_id, mask_t in obj_id_to_mask.items():
+            score = float(obj_id_to_score.get(obj_id, 1.0))
+            if score < self.score_threshold:
+                continue
+            mask_np = _mask_tensor_to_numpy(mask_t)
+            result_map.setdefault(int(obj_id), []).append(
+                (int(frame_idx), mask_np)
+            )
 
     def _process_raw_outputs(
         self,
@@ -334,26 +399,24 @@ class Sam3SegmentationTracker:
         result_map: dict[int, list[tuple[int, np.ndarray]]],
         max_frames: int | None,
     ) -> None:
-        """Parse a list of ``(frame_idx, obj_id_to_mask)`` pairs into *result_map*."""
+        """Parse a list of frame-output items into *result_map*.
+
+        Each item may be a ``(frame_idx, obj_id_to_mask)`` tuple, or a dict
+        in the format ``{"frame_index": N, "outputs": {...}}``.  Kept for
+        backward-compat with any callers using the old batch-output style.
+        """
         for item in outputs:
             if isinstance(item, (tuple, list)) and len(item) == 2:
                 frame_idx, obj_id_to_mask = item
+                if max_frames is not None and int(frame_idx) >= max_frames:
+                    continue
+                for obj_id, mask_t in obj_id_to_mask.items():
+                    mask_np = _mask_tensor_to_numpy(mask_t)
+                    result_map.setdefault(int(obj_id), []).append(
+                        (int(frame_idx), mask_np)
+                    )
             elif isinstance(item, dict):
-                frame_idx = item.get("frame_idx", item.get("frame_index", None))
-                obj_id_to_mask = item.get("obj_id_to_mask", {})
-            else:
-                continue
-
-            if frame_idx is None:
-                continue
-            if max_frames is not None and int(frame_idx) >= max_frames:
-                continue
-
-            for obj_id, mask_t in obj_id_to_mask.items():
-                mask_np = _mask_tensor_to_numpy(mask_t)
-                result_map.setdefault(int(obj_id), []).append(
-                    (int(frame_idx), mask_np)
-                )
+                self._process_frame_output(item, result_map, max_frames)
 
     # -------- low-level API (init_state / propagate_in_video) --------
 
