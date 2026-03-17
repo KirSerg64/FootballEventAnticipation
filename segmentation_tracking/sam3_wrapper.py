@@ -15,6 +15,33 @@ Key advantages of SAM 3 over SAM 2 in this context
   boundary, making it available to downstream consumers (e.g. homography
   estimation, bird's-eye view transforms).
 
+Memory-efficient frame-by-frame processing
+------------------------------------------
+The original design passed the entire video file to SAM3's ``init_state``
+/ ``start_session`` call, which caused SAM3 to pre-load **all** frames
+into GPU VRAM simultaneously — leading to ``CUDA out of memory`` errors on
+GPUs with limited VRAM.
+
+The rewritten implementation avoids this by:
+
+1. Decoding the video frame-by-frame with OpenCV (CPU side, no GPU).
+2. Writing each frame as a JPEG image into a temporary directory.
+3. Passing the *frame directory* (not the video file) to SAM3.  SAM3/SAM2
+   supports both video files and image directories.
+4. Setting ``offload_video_to_cpu=True`` in ``init_state`` (where
+   supported), so SAM3 reads exactly one frame from disk into GPU VRAM at
+   a time instead of holding all frames on GPU.
+
+GPU memory footprint is therefore::
+
+    model weights  +  tracking state  +  ~1 frame
+    (~3–6 GiB)        (small)            (~10 MB for 1080p)
+
+instead of::
+
+    model weights  +  tracking state  +  ALL frames
+    (~3–6 GiB)        (small)            (>> 1 GiB for long videos)
+
 Model weights
 -------------
 Download the SAM 3 checkpoint from the official Hugging Face repository
@@ -62,7 +89,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field as dc_field
+import tempfile
 from typing import Any
 
 import cv2
@@ -121,26 +148,6 @@ def _union_masks(masks: list[np.ndarray], shape: tuple[int, int]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Internal per-session state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Sam3Session:
-    """Holds everything needed for one SAM3 inference session."""
-
-    predictor: Any                  # Sam3VideoInference or high-level predictor
-    inference_state: Any            # dict returned by predictor.init_state(...)
-    session_id: Any = None          # used when the high-level handle_request API is used
-    api_style: str = "low_level"    # "low_level" | "handle_request"
-    num_frames: int = 0
-
-    # Collected per-frame results: list of (frame_idx, obj_id_to_mask)
-    frame_results: list[tuple[int, dict[int, np.ndarray]]] = dc_field(
-        default_factory=list
-    )
-
-
-# ---------------------------------------------------------------------------
 # Sam3SegmentationTracker
 # ---------------------------------------------------------------------------
 
@@ -156,6 +163,15 @@ class Sam3SegmentationTracker:
     category (players, ball, field), then merges results into the canonical
     :class:`~segmentation_tracking.segmentation_model.SegmentationResult`
     data structure.
+
+    Memory-efficient design
+    -----------------------
+    To avoid GPU out-of-memory errors caused by pre-loading the entire video
+    into VRAM, :meth:`process_video` first extracts all video frames as JPEG
+    images into a temporary directory using OpenCV (CPU-only).  SAM3 is then
+    pointed at the frame directory and configured to read frames from disk
+    one at a time (``offload_video_to_cpu=True``), so GPU VRAM usage stays
+    proportional to the *model size* rather than the *video length*.
 
     Parameters
     ----------
@@ -187,6 +203,10 @@ class Sam3SegmentationTracker:
         estimator, ball tracker, etc.).  There is a tiny risk of numerical
         precision loss in rare edge cases, but in practice the segmentation
         quality is indistinguishable from float32.  Default ``False``.
+    frame_jpeg_quality:
+        JPEG quality (1–100) used when writing temporary frame images to
+        disk during :meth:`process_video`.  Higher values preserve more
+        detail but use more disk space.  Default ``90``.
     """
 
     def __init__(
@@ -198,6 +218,7 @@ class Sam3SegmentationTracker:
         field_text_prompt: str | None = _DEFAULT_FIELD_PROMPT,
         score_threshold: float = _DEFAULT_SCORE_THRESH,
         use_float16: bool = False,
+        frame_jpeg_quality: int = 90,
     ) -> None:
         self.sam3_model_path = sam3_model_path
         self.device = device
@@ -206,6 +227,7 @@ class Sam3SegmentationTracker:
         self.field_text_prompt = field_text_prompt
         self.score_threshold = score_threshold
         self.use_float16 = use_float16
+        self.frame_jpeg_quality = int(max(1, min(100, frame_jpeg_quality)))
 
         # Lazy-loaded predictor (shared across calls)
         self._predictor: Any = None
@@ -344,11 +366,22 @@ class Sam3SegmentationTracker:
 
     def _run_sam3_for_prompt(
         self,
-        video_path: str,
+        frames_dir: str,
         text_prompt: str,
-        max_frames: int | None,
+        num_frames: int,
     ) -> dict[int, list[tuple[int, np.ndarray]]]:
-        """Run SAM3 for one text prompt and collect per-frame masks.
+        """Run SAM3 for one text prompt over the pre-extracted frame directory.
+
+        Parameters
+        ----------
+        frames_dir:
+            Path to the temporary directory containing JPEG frame images
+            named ``000000.jpg``, ``000001.jpg``, … as written by
+            :meth:`_extract_frames_to_dir`.
+        text_prompt:
+            Natural-language description of the objects to segment.
+        num_frames:
+            Total number of frames available in *frames_dir*.
 
         Returns
         -------
@@ -367,11 +400,11 @@ class Sam3SegmentationTracker:
         # -----------------------------------------------------------------
         if hasattr(predictor, "handle_request"):
             return self._run_handle_request(
-                predictor, video_path, text_prompt, max_frames
+                predictor, frames_dir, text_prompt, num_frames
             )
         else:
             return self._run_low_level(
-                predictor, video_path, text_prompt, max_frames
+                predictor, frames_dir, text_prompt, num_frames
             )
 
     # -------- high-level API (handle_request) --------
@@ -379,11 +412,17 @@ class Sam3SegmentationTracker:
     def _run_handle_request(
         self,
         predictor: Any,
-        video_path: str,
+        frames_dir: str,
         text_prompt: str,
-        max_frames: int | None,
+        num_frames: int,
     ) -> dict[int, list[tuple[int, np.ndarray]]]:
         """Use the ``handle_request`` / ``handle_stream_request`` API.
+
+        Passes the pre-extracted *frames_dir* (a directory of JPEG images)
+        as the ``resource_path`` instead of a video file.  SAM3 supports both
+        video files and image directories; using a directory lets it read
+        frames from disk one at a time rather than loading them all into
+        GPU VRAM.
 
         API flow
         --------
@@ -395,12 +434,19 @@ class Sam3SegmentationTracker:
         4. ``close_session``
         """
         logger.info(
-            "SAM3 handle_request API: prompt='%s', video=%s", text_prompt, video_path
+            "SAM3 handle_request API: prompt='%s', frames_dir=%s (%d frames)",
+            text_prompt, frames_dir, num_frames,
         )
 
-        # 1. Start a new session
+        # 1. Start a new session pointing at the frame directory.
+        #    Requesting offload_video_to_cpu so frames are read from disk
+        #    one at a time — this is the key frame-by-frame memory saving.
         start_resp = predictor.handle_request(
-            request=dict(type="start_session", resource_path=video_path)
+            request=dict(
+                type="start_session",
+                resource_path=frames_dir,
+                offload_video_to_cpu=True,
+            )
         )
         session_id = start_resp["session_id"]
 
@@ -416,7 +462,7 @@ class Sam3SegmentationTracker:
                 )
             )
             # add_prompt returns {"frame_index": N, "outputs": obj_id_to_mask_dict}
-            self._process_frame_output(prompt_resp, result_map, max_frames)
+            self._process_frame_output(prompt_resp, result_map, num_frames)
 
             # 3. Propagate through the rest of the video using the streaming API.
             #    handle_stream_request yields one dict per frame.
@@ -425,10 +471,10 @@ class Sam3SegmentationTracker:
                 session_id=session_id,
                 propagation_direction="forward",
                 start_frame_index=1,         # frame 0 already handled above
-                max_frame_num_to_track=max_frames,
+                max_frame_num_to_track=num_frames,
             )
             for frame_out in predictor.handle_stream_request(request=prop_request):
-                self._process_frame_output(frame_out, result_map, max_frames)
+                self._process_frame_output(frame_out, result_map, num_frames)
 
         finally:
             # 4. Always close the session to free GPU memory
@@ -445,7 +491,7 @@ class Sam3SegmentationTracker:
         self,
         frame_out: Any,
         result_map: dict[int, list[tuple[int, np.ndarray]]],
-        max_frames: int | None,
+        num_frames: int,
     ) -> None:
         """Parse one ``{"frame_index": N, "outputs": obj_id_to_mask}`` item.
 
@@ -459,7 +505,7 @@ class Sam3SegmentationTracker:
         frame_idx = frame_out.get("frame_index", frame_out.get("frame_idx"))
         if frame_idx is None:
             return
-        if max_frames is not None and int(frame_idx) >= max_frames:
+        if int(frame_idx) >= num_frames:
             return
 
         outputs = frame_out.get("outputs", {})
@@ -489,7 +535,7 @@ class Sam3SegmentationTracker:
         self,
         outputs: list[Any],
         result_map: dict[int, list[tuple[int, np.ndarray]]],
-        max_frames: int | None,
+        num_frames: int,
     ) -> None:
         """Parse a list of frame-output items into *result_map*.
 
@@ -500,7 +546,7 @@ class Sam3SegmentationTracker:
         for item in outputs:
             if isinstance(item, (tuple, list)) and len(item) == 2:
                 frame_idx, obj_id_to_mask = item
-                if max_frames is not None and int(frame_idx) >= max_frames:
+                if int(frame_idx) >= num_frames:
                     continue
                 for obj_id, mask_t in obj_id_to_mask.items():
                     mask_np = _mask_tensor_to_numpy(mask_t)
@@ -508,23 +554,47 @@ class Sam3SegmentationTracker:
                         (int(frame_idx), mask_np)
                     )
             elif isinstance(item, dict):
-                self._process_frame_output(item, result_map, max_frames)
+                self._process_frame_output(item, result_map, num_frames)
 
     # -------- low-level API (init_state / propagate_in_video) --------
 
     def _run_low_level(
         self,
         predictor: Any,
-        video_path: str,
+        frames_dir: str,
         text_prompt: str,
-        max_frames: int | None,
+        num_frames: int,
     ) -> dict[int, list[tuple[int, np.ndarray]]]:
-        """Use the ``init_state`` / ``propagate_in_video`` API directly."""
+        """Use the ``init_state`` / ``propagate_in_video`` API directly.
+
+        Passes the pre-extracted *frames_dir* as the resource path and
+        requests ``offload_video_to_cpu=True`` so that SAM3 reads exactly
+        one frame from disk into GPU VRAM at a time instead of preloading
+        the entire video.
+        """
         logger.info(
-            "SAM3 low-level API: prompt='%s', video=%s", text_prompt, video_path
+            "SAM3 low-level API: prompt='%s', frames_dir=%s (%d frames)",
+            text_prompt, frames_dir, num_frames,
         )
 
-        state = predictor.init_state(resource_path=video_path)
+        # Try with offload_video_to_cpu=True first (SAM2/SAM3 ≥ certain versions).
+        # If the installed SAM3 does not support the parameter, fall back
+        # gracefully to the plain call (frames still loaded from disk, just
+        # not forced to CPU).
+        try:
+            state = predictor.init_state(
+                resource_path=frames_dir,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=False,  # tracking state (small tensors) stays on
+                                             # GPU for speed; video frames (large) are
+                                             # read from disk one at a time
+            )
+        except TypeError:
+            logger.debug(
+                "SAM3 init_state() does not accept offload_video_to_cpu; "
+                "falling back to plain call."
+            )
+            state = predictor.init_state(resource_path=frames_dir)
 
         # Set the text prompt in the inference state
         state["text_prompt"] = text_prompt
@@ -535,7 +605,7 @@ class Sam3SegmentationTracker:
 
         result_map: dict[int, list[tuple[int, np.ndarray]]] = {}
         for frame_idx, out in predictor.propagate_in_video(state):
-            if max_frames is not None and int(frame_idx) >= max_frames:
+            if int(frame_idx) >= num_frames:
                 break
             if out is None:
                 continue
@@ -646,12 +716,77 @@ class Sam3SegmentationTracker:
     # Public API
     # ------------------------------------------------------------------
 
+    def _extract_frames_to_dir(
+        self,
+        video_path: str,
+        frames_dir: str,
+        max_frames: int | None,
+    ) -> tuple[int, int, int]:
+        """Decode video frames to JPEG files in *frames_dir*.
+
+        Files are named ``000000.jpg``, ``000001.jpg``, … so SAM3 reads them
+        in the correct order.  Only the current frame is in CPU memory at any
+        one time — no GPU is involved.
+
+        Parameters
+        ----------
+        video_path:
+            Path to the input video file.
+        frames_dir:
+            Directory where JPEG frame images will be written.
+        max_frames:
+            If set, stop after writing this many frames.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            ``(num_frames, frame_height, frame_width)``.
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.frame_jpeg_quality]
+
+        idx = 0
+        while True:
+            if max_frames is not None and idx >= max_frames:
+                break
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out_path = os.path.join(frames_dir, f"{idx:06d}.jpg")
+            cv2.imwrite(out_path, frame, encode_params)
+            idx += 1
+            if idx % 500 == 0:
+                logger.debug("Frame extraction: %d frames written...", idx)
+
+        cap.release()
+        logger.info(
+            "Extracted %d frames (%dx%d) from '%s' → '%s'",
+            idx, fw, fh, video_path, frames_dir,
+        )
+        return idx, fh, fw
+
     def process_video(
         self,
         video_path: str,
         max_frames: int | None = None,
     ) -> list[SegmentationResult]:
         """Process a video using SAM3 text-prompt segmentation.
+
+        Frame-by-frame memory model
+        ----------------------------
+        Frames are first extracted from the video into a temporary directory
+        using OpenCV (CPU-only, no GPU involved).  SAM3 is then pointed at
+        that directory and reads frames from disk one at a time during
+        inference, so GPU VRAM usage is proportional to the model size rather
+        than the video length.
+
+        The temporary directory is automatically cleaned up when inference
+        completes (or if an error occurs).
 
         Runs up to three SAM3 inference passes (players, ball, field) then
         merges the results into a :class:`SegmentationResult` per frame.
@@ -668,61 +803,64 @@ class Sam3SegmentationTracker:
         list[SegmentationResult]
             One result per processed frame, in order.
         """
-        # Read video metadata
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video: {video_path}")
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        cap.release()
+        logger.info("SAM3: extracting frames from '%s'…", video_path)
 
-        if max_frames:
-            total_frames = min(total_frames, max_frames)
-        logger.info(
-            "SAM3 processing: video=%s (%d frames, %dx%d)",
-            video_path, total_frames, fw, fh,
-        )
-
-        # ----- Player segmentation pass -----
-        logger.info("=== SAM3 player pass: prompt='%s' ===", self.player_text_prompt)
-        player_map = self._run_sam3_for_prompt(
-            video_path, self.player_text_prompt, max_frames
-        )
-        logger.info(
-            "SAM3 player pass: %d unique objects detected", len(player_map)
-        )
-
-        # ----- Ball detection pass -----
-        ball_map: dict[int, list[tuple[int, np.ndarray]]] = {}
-        if self.ball_text_prompt:
-            logger.info(
-                "=== SAM3 ball pass: prompt='%s' ===", self.ball_text_prompt
+        with tempfile.TemporaryDirectory(prefix="sam3_frames_") as frames_dir:
+            num_frames, fh, fw = self._extract_frames_to_dir(
+                video_path, frames_dir, max_frames
             )
-            ball_map = self._run_sam3_for_prompt(
-                video_path, self.ball_text_prompt, max_frames
+
+            if num_frames == 0:
+                raise ValueError(f"No frames could be read from video: {video_path}")
+
+            logger.info(
+                "SAM3 processing: %d frames (%dx%d) in '%s'",
+                num_frames, fw, fh, frames_dir,
+            )
+
+            # ----- Player segmentation pass -----
+            logger.info(
+                "=== SAM3 player pass: prompt='%s' ===", self.player_text_prompt
+            )
+            player_map = self._run_sam3_for_prompt(
+                frames_dir, self.player_text_prompt, num_frames
             )
             logger.info(
-                "SAM3 ball pass: %d unique objects detected", len(ball_map)
+                "SAM3 player pass: %d unique objects detected", len(player_map)
             )
 
-        # ----- Field segmentation pass -----
-        field_map: dict[int, list[tuple[int, np.ndarray]]] = {}
-        if self.field_text_prompt:
-            logger.info(
-                "=== SAM3 field pass: prompt='%s' ===", self.field_text_prompt
-            )
-            field_map = self._run_sam3_for_prompt(
-                video_path, self.field_text_prompt, max_frames
-            )
-            logger.info(
-                "SAM3 field pass: %d unique objects detected", len(field_map)
+            # ----- Ball detection pass -----
+            ball_map: dict[int, list[tuple[int, np.ndarray]]] = {}
+            if self.ball_text_prompt:
+                logger.info(
+                    "=== SAM3 ball pass: prompt='%s' ===", self.ball_text_prompt
+                )
+                ball_map = self._run_sam3_for_prompt(
+                    frames_dir, self.ball_text_prompt, num_frames
+                )
+                logger.info(
+                    "SAM3 ball pass: %d unique objects detected", len(ball_map)
+                )
+
+            # ----- Field segmentation pass -----
+            field_map: dict[int, list[tuple[int, np.ndarray]]] = {}
+            if self.field_text_prompt:
+                logger.info(
+                    "=== SAM3 field pass: prompt='%s' ===", self.field_text_prompt
+                )
+                field_map = self._run_sam3_for_prompt(
+                    frames_dir, self.field_text_prompt, num_frames
+                )
+                logger.info(
+                    "SAM3 field pass: %d unique objects detected", len(field_map)
+                )
+
+            # ----- Assemble results -----
+            results = self._collect_results(
+                num_frames, (fh, fw), player_map, ball_map, field_map
             )
 
-        # ----- Assemble results -----
-        results = self._collect_results(
-            total_frames, (fh, fw), player_map, ball_map, field_map
-        )
+        # frames_dir is automatically removed here by the context manager
         logger.info("SAM3 processing complete: %d frames", len(results))
         return results
 

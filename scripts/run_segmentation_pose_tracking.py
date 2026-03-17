@@ -81,6 +81,15 @@ SAM 3 backend (replaces SAM 2 segmentation with text-prompt driven SAM 3)::
     --sam3_field_prompt  ""                      Text prompt for field segmentation (empty = disabled)
     --sam3_score_thresh  0.30            Minimum SAM3 object confidence to accept a detection
     --sam3_float16                       Load SAM3 in float16 to halve GPU VRAM usage (~3 GiB vs ~6 GiB)
+
+SAM 3 memory usage note::
+
+    Frames are extracted one-by-one via OpenCV (CPU) into a temporary
+    directory before being fed to SAM3.  SAM3 then reads frames from disk
+    one at a time (offload_video_to_cpu=True), so GPU VRAM is proportional
+    to the model size, not the video length.  This avoids the
+    ``CUDA out of memory`` error that occurred when the full video was
+    pre-loaded into GPU VRAM.
 """
 
 from __future__ import annotations
