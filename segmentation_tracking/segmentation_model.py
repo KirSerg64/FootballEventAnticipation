@@ -230,6 +230,12 @@ class SegmentationResult:
         Bounding box for the ball ``[x1, y1, x2, y2]``, or *None*.
     ball_center:
         ``(cx, cy)`` pixel position of the ball centre, or *None*.
+    field_mask:
+        Binary mask covering the playing field (populated by
+        :class:`~segmentation_tracking.sam3_wrapper.Sam3SegmentationTracker`
+        when ``field_text_prompt`` is set), or *None*.
+    field_bbox:
+        Bounding box ``[x1, y1, x2, y2]`` of the field region, or *None*.
     """
 
     frame_index: int = 0
@@ -247,6 +253,16 @@ class SegmentationResult:
     ``"mosse"``     — MOSSE correlation filter gap-fill.
     ``"predicted"`` — velocity extrapolation (no appearance evidence).
     ``"none"``      — ball not visible / tracker not yet initialised.
+    """
+    field_mask: np.ndarray | None = None
+    """Binary uint8 mask (0/255) covering the playing field, or *None* when
+    field segmentation is disabled or no field was found in this frame.
+    Populated by :class:`~segmentation_tracking.sam3_wrapper.Sam3SegmentationTracker`
+    when a ``field_text_prompt`` is provided.
+    """
+    field_bbox: np.ndarray | None = None
+    """Bounding box ``[x1, y1, x2, y2]`` of the playing field region, or
+    *None*.  Derived from :attr:`field_mask` when present.
     """
 
 

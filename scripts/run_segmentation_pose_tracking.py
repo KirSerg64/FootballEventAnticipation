@@ -71,6 +71,15 @@ Player-only tracking (out-of-the-box, no custom model required)::
     --field_hsv_hi       85,255,255      HSV upper bound for field mask
     --field_min_overlap  0.3             Min fraction of bbox foot-region on green pixels to keep the person
     --field_mask_interval 15             Recompute field mask every N frames
+
+SAM 3 backend (replaces SAM 2 segmentation with text-prompt driven SAM 3)::
+
+    --sam_backend        sam2            Segmentation backend: sam2 (default) | sam3
+    --sam3_model         weights/sam3/sam3.pt   SAM3 checkpoint path
+    --sam3_player_prompt "football player"       Text prompt for player detection
+    --sam3_ball_prompt   "sports ball"           Text prompt for ball detection (empty string to disable)
+    --sam3_field_prompt  ""                      Text prompt for field segmentation (empty = disabled)
+    --sam3_score_thresh  0.30            Minimum SAM3 object confidence to accept a detection
 """
 
 from __future__ import annotations
@@ -89,6 +98,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from segmentation_tracking import (
     SegmentationTracker,
+    Sam3SegmentationTracker,
     Visualizer,
     associate_poses_with_tracks,
     TeamClassifier,
@@ -532,6 +542,58 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "higher values are faster.  Used only when --field_mask_filter is set."
         ),
     )
+    # ── SAM 3 backend ────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--sam_backend", default="sam2", choices=["sam2", "sam3"],
+        help=(
+            "Segmentation backend to use for player masking (default: 'sam2').  "
+            "'sam3' switches to the SAM 3 text-prompt-driven tracker "
+            "(Sam3SegmentationTracker) which requires the 'sam3' Python package "
+            "and a SAM3 checkpoint.  See weights/sam3/README.md for setup "
+            "instructions.  When 'sam3' is selected the --det_model / --sam_model "
+            "arguments are ignored and replaced by the --sam3_* flags below."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_model", default="weights/sam3/sam3.pt",
+        help=(
+            "Path to the SAM3 checkpoint file (default: 'weights/sam3/sam3.pt').  "
+            "Used only when --sam_backend sam3 is set."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_player_prompt", default="football player",
+        help=(
+            "Text prompt describing the objects to track as players "
+            "(default: 'football player').  SAM3 detects and tracks all instances "
+            "of this concept across the video.  Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_ball_prompt", default="sports ball",
+        help=(
+            "Text prompt for the ball (default: 'sports ball').  Pass an empty "
+            "string ('') to disable SAM3-based ball detection.  "
+            "Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_field_prompt", default="",
+        help=(
+            "Text prompt for the playing field (default: '' = disabled).  "
+            "When non-empty (e.g. 'football pitch'), SAM3 segments the field and "
+            "the result is stored in SegmentationResult.field_mask and visualised "
+            "as a lime-green boundary overlay.  "
+            "Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_score_thresh", type=float, default=0.30,
+        help=(
+            "Minimum SAM3 object confidence score to accept a detection "
+            "(default: 0.30).  Used only with --sam_backend sam3."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -654,40 +716,59 @@ def run_pipeline(args: argparse.Namespace) -> None:
     output_dir = Path(args.output).parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- Step 1: Segmentation + tracking (BoT-SORT + SAM2) --------------------
+    # -- Step 1: Segmentation + tracking (BoT-SORT + SAM2 or SAM3) ------------
     logger.info(
-        "=== Step 1: Player segmentation and tracking (%s + SAM2) ===",
-        args.tracker.upper(),
+        "=== Step 1: Player segmentation and tracking (backend=%s) ===",
+        args.sam_backend.upper(),
     )
-    tracker = SegmentationTracker(
-        sam_model_path=args.sam_model,
-        det_model_path=args.det_model,
-        device=args.device,
-        conf_threshold=args.conf,
-        iou_threshold=args.iou,
-        redetect_interval=args.redetect_interval,
-        tracker=args.tracker,
-        max_age=args.max_age,
-        use_homography=not args.no_homography,
-        ball_patch_size=args.ball_patch_size,
-        ball_search_radius=args.ball_search_radius,
-        ball_psr_threshold=args.ball_psr_threshold,
-        ball_conf_threshold=args.ball_conf,
-        ball_conf_roi=args.ball_conf_roi,
-        ball_tracker_type=args.ball_tracker,
-        ball_cotracker_model=args.cotracker_model,
-        ball_cotracker_checkpoint=args.cotracker_checkpoint,
-        ball_cotracker_device=args.device,
-        ball_cotracker_redetect_interval=args.ball_ct_redetect,
-        ball_det_model_path=args.ball_det_model,
-        ball_det_conf=args.ball_det_conf,
-        player_class_ids=[int(x) for x in args.player_class_ids.split(",") if x.strip()],
-        field_mask_filter=args.field_mask_filter,
-        field_hsv_lo=tuple(int(x) for x in args.field_hsv_lo.split(",")),  # type: ignore[arg-type]
-        field_hsv_hi=tuple(int(x) for x in args.field_hsv_hi.split(",")),  # type: ignore[arg-type]
-        field_min_overlap=args.field_min_overlap,
-        field_mask_interval=args.field_mask_interval,
-    )
+
+    if args.sam_backend == "sam3":
+        # SAM3 text-prompt-driven tracker
+        tracker = Sam3SegmentationTracker(
+            sam3_model_path=args.sam3_model,
+            device=args.device,
+            player_text_prompt=args.sam3_player_prompt,
+            ball_text_prompt=args.sam3_ball_prompt or None,
+            field_text_prompt=args.sam3_field_prompt or None,
+            score_threshold=args.sam3_score_thresh,
+        )
+        logger.info(
+            "SAM3 tracker: player='%s', ball='%s', field='%s'",
+            args.sam3_player_prompt,
+            args.sam3_ball_prompt or "(disabled)",
+            args.sam3_field_prompt or "(disabled)",
+        )
+    else:
+        # Default SAM2 + YOLO BoT-SORT tracker
+        tracker = SegmentationTracker(
+            sam_model_path=args.sam_model,
+            det_model_path=args.det_model,
+            device=args.device,
+            conf_threshold=args.conf,
+            iou_threshold=args.iou,
+            redetect_interval=args.redetect_interval,
+            tracker=args.tracker,
+            max_age=args.max_age,
+            use_homography=not args.no_homography,
+            ball_patch_size=args.ball_patch_size,
+            ball_search_radius=args.ball_search_radius,
+            ball_psr_threshold=args.ball_psr_threshold,
+            ball_conf_threshold=args.ball_conf,
+            ball_conf_roi=args.ball_conf_roi,
+            ball_tracker_type=args.ball_tracker,
+            ball_cotracker_model=args.cotracker_model,
+            ball_cotracker_checkpoint=args.cotracker_checkpoint,
+            ball_cotracker_device=args.device,
+            ball_cotracker_redetect_interval=args.ball_ct_redetect,
+            ball_det_model_path=args.ball_det_model,
+            ball_det_conf=args.ball_det_conf,
+            player_class_ids=[int(x) for x in args.player_class_ids.split(",") if x.strip()],
+            field_mask_filter=args.field_mask_filter,
+            field_hsv_lo=tuple(int(x) for x in args.field_hsv_lo.split(",")),  # type: ignore[arg-type]
+            field_hsv_hi=tuple(int(x) for x in args.field_hsv_hi.split(",")),  # type: ignore[arg-type]
+            field_min_overlap=args.field_min_overlap,
+            field_mask_interval=args.field_mask_interval,
+        )
     seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))
 
@@ -907,6 +988,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             velocities=velocities,
             attractor=attractor,
             ct_trajectories=ct_trajectories,
+            field_mask=seg_result.field_mask,
         )
         writer.write(annotated)
 

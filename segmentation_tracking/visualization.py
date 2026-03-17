@@ -188,6 +188,7 @@ class Visualizer:
         velocities: dict[int, tuple[float, float, float, float]] | None = None,
         attractor: AttractorEstimate | None = None,
         ct_trajectories: dict[int, list[tuple[float, float]]] | None = None,
+        field_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Annotate a single frame and return the result.
@@ -219,6 +220,11 @@ class Visualizer:
             from
             :meth:`~segmentation_tracking.vector_field.KeypointVelocityTracker.get_ct_trajectories`.
             Drawn when ``show_ct_trajectories`` is *True*.
+        field_mask:
+            Optional binary uint8 mask (0/255) of the playing field produced
+            by :class:`~segmentation_tracking.sam3_wrapper.Sam3SegmentationTracker`.
+            When supplied, the field boundary is drawn as a thin coloured
+            contour beneath all other overlays.
 
         Returns
         -------
@@ -226,6 +232,10 @@ class Visualizer:
             Annotated BGR image of the same shape as *frame*.
         """
         canvas = frame.copy()
+
+        # Draw field boundary (beneath everything else so it doesn't occlude players)
+        if field_mask is not None:
+            canvas = self._draw_field_boundary(canvas, field_mask)
 
         # Draw CoTracker3 trajectories beneath everything else
         if self.show_ct_trajectories and ct_trajectories:
@@ -272,6 +282,53 @@ class Visualizer:
         return canvas
 
     # ── Private drawing helpers ───────────────────────────────────────────────
+
+    def _draw_field_boundary(
+        self,
+        canvas: np.ndarray,
+        field_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Draw the football-field boundary as a lime-green contour.
+
+        A thin contour is drawn around the outermost edge of *field_mask*
+        so the playing area is clearly visible without obscuring the frame
+        content beneath it.  A very light semi-transparent fill is also
+        applied to make the field region easy to identify at a glance.
+        """
+        # Ensure the mask is the same spatial size as canvas
+        mh, mw = field_mask.shape[:2]
+        ch, cw = canvas.shape[:2]
+        if mh != ch or mw != cw:
+            field_mask = cv2.resize(
+                field_mask, (cw, ch), interpolation=cv2.INTER_NEAREST
+            )
+
+        # Semi-transparent fill: lime green at very low opacity
+        _FIELD_FILL = (0, 230, 80)        # BGR lime green
+        _FIELD_FILL_ALPHA = 0.08          # 8 % opacity
+        _FIELD_CONTOUR = (0, 255, 60)     # bright green
+        _FIELD_CONTOUR_THICK = 2
+
+        field_bool = field_mask > 0
+        if not field_bool.any():
+            return canvas
+
+        overlay = canvas.copy()
+        overlay[field_bool] = (
+            np.array(overlay[field_bool], dtype=np.float32) * (1 - _FIELD_FILL_ALPHA)
+            + np.array(_FIELD_FILL, dtype=np.float32) * _FIELD_FILL_ALPHA
+        ).astype(np.uint8)
+
+        # Find and draw contours
+        contours, _ = cv2.findContours(
+            field_mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(overlay, contours, -1, _FIELD_CONTOUR, _FIELD_CONTOUR_THICK)
+        canvas = overlay
+
+        return canvas
 
     def _draw_mask(
         self,
