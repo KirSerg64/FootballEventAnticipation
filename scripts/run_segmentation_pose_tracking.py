@@ -45,7 +45,8 @@ Optional flags::
     --tracker            botsort          Primary tracker: botsort or bytetrack
     --max_age            30               Max frames a track survives without detection
     --no_homography                       Disable camera-motion compensation
-    --team_colors                         Enable jersey-colour team classification
+    --team_colors                         Enable team classification (jersey colours)
+    --team_classifier    siglip           Team classification backend: siglip (default) | hue
     --n_teams            2                Number of team clusters (2 or 3)
     --team_refit_interval 30             Refit team clusters every N frames (default 30)
     --ball_patch_size    32               Ball DCF MOSSE template patch size (px)
@@ -81,6 +82,7 @@ SAM 3 backend (replaces SAM 2 segmentation with text-prompt driven SAM 3)::
     --sam3_field_prompt  ""                      Text prompt for field segmentation (empty = disabled)
     --sam3_score_thresh  0.30            Minimum SAM3 object confidence to accept a detection
     --sam3_float16                       Load SAM3 in float16 to halve GPU VRAM usage (~3 GiB vs ~6 GiB)
+    --no_sam3_fallback                   Disable automatic SAM2 fallback on SAM3 failure (default: fallback enabled)
 
 SAM 3 memory usage note::
 
@@ -90,6 +92,11 @@ SAM 3 memory usage note::
     to the model size, not the video length.  This avoids the
     ``CUDA out of memory`` error that occurred when the full video was
     pre-loaded into GPU VRAM.
+
+    When SAM3 encounters any execution error (import failure, RuntimeError,
+    CUDA OOM, etc.) the pipeline automatically retries with SAM2 + YOLO so
+    the job always produces annotated output.  Use --no_sam3_fallback to
+    let SAM3 errors propagate instead.
 """
 
 from __future__ import annotations
@@ -112,6 +119,8 @@ from segmentation_tracking import (
     Visualizer,
     associate_poses_with_tracks,
     TeamClassifier,
+    SiglipTeamClassifier,
+    create_team_classifier,
     PlayerVelocityTracker,
     KeypointVelocityTracker,
     estimate_attractor,
@@ -396,7 +405,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Improvement F: team colour clustering
     parser.add_argument(
         "--team_colors", action="store_true",
-        help="Enable jersey-colour K-means team classification",
+        help="Enable jersey-colour team classification",
+    )
+    parser.add_argument(
+        "--team_classifier", default="siglip", choices=["siglip", "hue"],
+        help=(
+            "Team classification backend (default: 'siglip').  "
+            "'siglip' uses google/siglip-base-patch16-224 vision embeddings + scikit-learn "
+            "KMeans for accurate team assignment that is robust to similar jersey colours.  "
+            "Player segmentation masks are used to blank out the background before "
+            "embedding for cleaner features.  Requires transformers, scikit-learn, torch.  "
+            "'hue' uses the lightweight HSV hue K-means classifier (no extra dependencies).  "
+            "Falls back to 'hue' automatically when SIGLIP dependencies are missing."
+        ),
     )
     parser.add_argument(
         "--n_teams", type=int, default=2,
@@ -613,6 +634,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Used only with --sam_backend sam3."
         ),
     )
+    parser.add_argument(
+        "--no_sam3_fallback", action="store_true", default=False,
+        help=(
+            "Disable the automatic SAM2 + YOLO fallback that runs when SAM3 "
+            "encounters an error (ImportError, RuntimeError, CUDA OOM, …).  "
+            "By default the pipeline transparently retries with SAM2 so the job "
+            "always produces output.  Pass this flag to let SAM3 errors propagate "
+            "and crash the process — useful when debugging SAM3 itself."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -741,26 +772,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         args.sam_backend.upper(),
     )
 
-    if args.sam_backend == "sam3":
-        # SAM3 text-prompt-driven tracker
-        tracker = Sam3SegmentationTracker(
-            sam3_model_path=args.sam3_model,
-            device=args.device,
-            player_text_prompt=args.sam3_player_prompt,
-            ball_text_prompt=args.sam3_ball_prompt or None,
-            field_text_prompt=args.sam3_field_prompt or None,
-            score_threshold=args.sam3_score_thresh,
-            use_float16=args.sam3_float16,
-        )
-        logger.info(
-            "SAM3 tracker: player='%s', ball='%s', field='%s'",
-            args.sam3_player_prompt,
-            args.sam3_ball_prompt or "(disabled)",
-            args.sam3_field_prompt or "(disabled)",
-        )
-    else:
-        # Default SAM2 + YOLO BoT-SORT tracker
-        tracker = SegmentationTracker(
+    def _build_sam2_tracker() -> SegmentationTracker:
+        """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
+        return SegmentationTracker(
             sam_model_path=args.sam_model,
             det_model_path=args.det_model,
             device=args.device,
@@ -789,7 +803,45 @@ def run_pipeline(args: argparse.Namespace) -> None:
             field_min_overlap=args.field_min_overlap,
             field_mask_interval=args.field_mask_interval,
         )
-    seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+
+    if args.sam_backend == "sam3":
+        # SAM3 text-prompt-driven tracker with automatic SAM2 fallback
+        logger.info(
+            "SAM3 tracker: player='%s', ball='%s', field='%s'",
+            args.sam3_player_prompt,
+            args.sam3_ball_prompt or "(disabled)",
+            args.sam3_field_prompt or "(disabled)",
+        )
+        try:
+            tracker: SegmentationTracker | Sam3SegmentationTracker = Sam3SegmentationTracker(
+                sam3_model_path=args.sam3_model,
+                device=args.device,
+                player_text_prompt=args.sam3_player_prompt,
+                ball_text_prompt=args.sam3_ball_prompt or None,
+                field_text_prompt=args.sam3_field_prompt or None,
+                score_threshold=args.sam3_score_thresh,
+                use_float16=args.sam3_float16,
+            )
+            seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+        except Exception as sam3_exc:  # noqa: BLE001
+            logger.warning(
+                "SAM3 processing failed: %s\n"
+                "  Error type : %s\n"
+                "  Falling back to SAM2 + YOLO pipeline%s",
+                sam3_exc,
+                type(sam3_exc).__name__,
+                "" if not getattr(args, "no_sam3_fallback", False)
+                else "  (fallback disabled — re-raising)",
+            )
+            if getattr(args, "no_sam3_fallback", False):
+                raise
+            logger.info("Building SAM2 + YOLO fallback tracker …")
+            tracker = _build_sam2_tracker()
+            seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+    else:
+        # Default SAM2 + YOLO BoT-SORT tracker
+        tracker = _build_sam2_tracker()
+        seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))
 
     # -- Step 2: Pose estimation -----------------------------------------------
@@ -800,10 +852,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
     pose_estimator = _build_pose_estimator(args)
 
     # -- Team colour classifier (optional) ------------------------------------
-    team_classifier: TeamClassifier | None = None
+    team_classifier: TeamClassifier | SiglipTeamClassifier | None = None
     if args.team_colors:
-        logger.info("Team colour classification enabled (n_teams=%d)", args.n_teams)
-        team_classifier = TeamClassifier(n_teams=args.n_teams)
+        _tc_backend = getattr(args, "team_classifier", "siglip")
+        logger.info(
+            "Team classification enabled (backend=%s, n_teams=%d)",
+            _tc_backend,
+            args.n_teams,
+        )
+        team_classifier = create_team_classifier(
+            backend=_tc_backend,
+            n_teams=args.n_teams,
+            device=args.device,
+        )
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -893,7 +954,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if team_classifier is not None:
             for pt in player_tracks:
                 crop = TeamClassifier.extract_torso_crop(frame, pt.bbox)
-                team_classifier.update(pt.id, crop)
+                # Pass the player mask to SIGLIP so background is blanked out;
+                # HSV classifier ignores the mask keyword argument.
+                team_classifier.update(pt.id, crop, mask=pt.mask)
 
             # Refit at configured interval; try fast assignment for new players otherwise
             if frame_idx % args.team_refit_interval == 0:
