@@ -1590,6 +1590,45 @@ class BallCoTrackerTracker:
             return float(self._last_cx), float(self._last_cy)
         return float(self._last_cx) + vel[0], float(self._last_cy) + vel[1]
 
+    # ── Player-proximity guard ────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_in_player_feet(
+        pos: tuple[float, float],
+        player_bboxes: list | None,
+        feet_fraction: float = 0.40,
+    ) -> bool:
+        """Return *True* if *pos* is inside the foot zone of any player bbox.
+
+        The foot zone is the bottom *feet_fraction* (default 40 %) of each
+        player bounding box.  When CoTracker3 drifts onto a player's boot
+        during a ball-contact frame this check lets the caller fall back to
+        velocity extrapolation instead of trusting the corrupted track.
+
+        Parameters
+        ----------
+        pos:
+            ``(cx, cy)`` pixel coordinate to test.
+        player_bboxes:
+            List of ``[x1, y1, x2, y2]`` arrays (or sequences) for each
+            tracked player.  May be *None* or empty.
+        feet_fraction:
+            Fraction of the player height (measured from the bottom) that
+            counts as the foot region.
+        """
+        if not player_bboxes:
+            return False
+        cx, cy = pos
+        for bbox in player_bboxes:
+            x1 = float(bbox[0])
+            y1 = float(bbox[1])
+            x2 = float(bbox[2])
+            y2 = float(bbox[3])
+            feet_y_top = y2 - (y2 - y1) * feet_fraction
+            if x1 <= cx <= x2 and feet_y_top <= cy <= y2:
+                return True
+        return False
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def update(
@@ -1657,17 +1696,28 @@ class BallCoTrackerTracker:
         self._last_source = "detected"
         return cx, cy
 
-    def predict(self, frame: np.ndarray | None = None) -> tuple[float, float]:
+    def predict(
+        self,
+        frame: np.ndarray | None = None,
+        player_bboxes: list | None = None,
+    ) -> tuple[float, float]:
         """Propagate the ball position when YOLO misses.
 
         Runs CoTracker3 on the new frame and returns its tracked position.
         Falls back to velocity extrapolation if CoTracker3 has not yet
-        produced output (warm-up phase) or if the model is unavailable.
+        produced output (warm-up phase), if the model is unavailable, or if
+        the CoTracker3 position falls inside a player's foot zone (which
+        indicates that the tracker drifted onto a boot during ball contact).
 
         Parameters
         ----------
         frame:
             Current BGR uint8 video frame.
+        player_bboxes:
+            Optional list of ``[x1, y1, x2, y2]`` bounding boxes for all
+            currently tracked players.  When provided, CoTracker3 output that
+            lands inside the lower 40 % of any player bbox is rejected and
+            velocity extrapolation is used instead (foot-drift guard).
 
         Returns
         -------
@@ -1685,11 +1735,22 @@ class BallCoTrackerTracker:
             self._add_frame(frame)
             ran = self._run_cotracker()
             if ran and self._ct_position is not None:
-                cx, cy = self._ct_position
-                self._last_cx = cx
-                self._last_cy = cy
-                self._last_source = "cotracker"
-                return cx, cy
+                # Foot-contact guard: if CoTracker3 drifted onto a player's
+                # foot area, distrust the result and fall through to velocity
+                # extrapolation for this frame.
+                if self._is_in_player_feet(self._ct_position, player_bboxes):
+                    logger.debug(
+                        "BallCoTrackerTracker: CT position (%.0f,%.0f) is inside "
+                        "a player foot region — using velocity extrapolation.",
+                        self._ct_position[0],
+                        self._ct_position[1],
+                    )
+                else:
+                    cx, cy = self._ct_position
+                    self._last_cx = cx
+                    self._last_cy = cy
+                    self._last_source = "cotracker"
+                    return cx, cy
 
         # Warm-up fallback: velocity extrapolation
         cx, cy = self._extrapolate()

@@ -64,11 +64,30 @@ _BALL_SOURCE_LABELS: dict[str, str] = {
 # Golden ratio conjugate – spreads player IDs to perceptually distinct hues
 _GOLDEN_RATIO = 0.6180339887
 
+# Team colours (BGR) — used when a player's team label is known.
+# Label 0 → Team 1 (red), label 1 → Team 2 (blue).
+# These are intentionally high-saturation and visually distinct.
+_TEAM_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (35, 60, 230),    # warm red  (BGR: B=35, G=60, R=230)
+    1: (220, 120, 30),   # deep blue (BGR: B=220, G=120, R=30)
+}
+# Display names shown in the label next to the player ID
+_TEAM_DISPLAY: dict[int, str] = {0: "T1", 1: "T2"}
+
 # Attractor visualisation constants
 _ATTRACTOR_COLOR    = (0, 255, 255)    # cyan diamond (same as default ball, but distinct marker)
 _ATTRACTOR_HI_COLOR = (0, 255, 200)    # high-confidence → bright cyan-green
 _ATTRACTOR_LO_COLOR = (0, 130, 255)    # low-confidence  → orange-yellow
 _VECTOR_ALPHA       = 0.70             # opacity of velocity arrows
+
+# Ball-centric action-focus marker (source="ball"): golden crosshair/target
+_BALL_FOCUS_COLOR   = (0, 200, 255)    # gold / amber (BGR)
+_BALL_FOCUS_RING_COLOR = (0, 165, 255) # slightly deeper amber for the outer ring
+
+# Adaptive label font scale: derived from bbox height so tiny players get small text
+_LABEL_SCALE_MIN  = 0.28   # minimum scale (very small/distant players)
+_LABEL_SCALE_MAX  = 0.58   # maximum scale (close-up players)
+_LABEL_SCALE_REF  = 180.0  # bbox height (px) that produces scale = 1.0 before clamping
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +99,22 @@ def _id_to_color(player_id: int) -> tuple[int, int, int]:
     hue = (player_id * _GOLDEN_RATIO) % 1.0
     r, g, b = colorsys.hsv_to_rgb(hue, 0.85, 0.95)
     return (int(b * 255), int(g * 255), int(r * 255))  # BGR
+
+
+def _player_color(
+    player_id: int,
+    team_label: int | None = None,
+) -> tuple[int, int, int]:
+    """Return the display colour for a player.
+
+    When *team_label* is set (0 or 1) the fixed team colour is returned so
+    that all players on the same team share a consistent visual identity.
+    For unclassified players the golden-ratio ID-based colour is used so
+    each unclassified player still has a unique hue.
+    """
+    if team_label is not None and team_label in _TEAM_COLORS:
+        return _TEAM_COLORS[team_label]
+    return _id_to_color(player_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +219,7 @@ class Visualizer:
         velocities: dict[int, tuple[float, float, float, float]] | None = None,
         attractor: AttractorEstimate | None = None,
         ct_trajectories: dict[int, list[tuple[float, float]]] | None = None,
+        field_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Annotate a single frame and return the result.
@@ -215,6 +251,11 @@ class Visualizer:
             from
             :meth:`~segmentation_tracking.vector_field.KeypointVelocityTracker.get_ct_trajectories`.
             Drawn when ``show_ct_trajectories`` is *True*.
+        field_mask:
+            Optional binary uint8 mask (0/255) of the playing field produced
+            by :class:`~segmentation_tracking.sam3_wrapper.Sam3SegmentationTracker`.
+            When supplied, the field boundary is drawn as a thin coloured
+            contour beneath all other overlays.
 
         Returns
         -------
@@ -223,13 +264,17 @@ class Visualizer:
         """
         canvas = frame.copy()
 
+        # Draw field boundary (beneath everything else so it doesn't occlude players)
+        if field_mask is not None:
+            canvas = self._draw_field_boundary(canvas, field_mask)
+
         # Draw CoTracker3 trajectories beneath everything else
         if self.show_ct_trajectories and ct_trajectories:
             self._draw_ct_trajectories(canvas, ct_trajectories)
 
         # Draw player segmentation masks (colour overlay)
         for track in player_tracks:
-            color = _id_to_color(track.id)
+            color = _player_color(track.id, track.team_label)
             canvas = self._draw_mask(canvas, track.mask, color)
 
         # Draw velocity arrows behind bounding boxes (so boxes are on top)
@@ -238,7 +283,7 @@ class Visualizer:
 
         # Draw player bounding boxes, IDs, and skeletons on top of masks
         for track in player_tracks:
-            color = _id_to_color(track.id)
+            color = _player_color(track.id, track.team_label)
             if self.show_bbox:
                 self._draw_bbox(canvas, track.bbox, color)
             if self.show_id:
@@ -268,6 +313,53 @@ class Visualizer:
         return canvas
 
     # ── Private drawing helpers ───────────────────────────────────────────────
+
+    def _draw_field_boundary(
+        self,
+        canvas: np.ndarray,
+        field_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Draw the football-field boundary as a lime-green contour.
+
+        A thin contour is drawn around the outermost edge of *field_mask*
+        so the playing area is clearly visible without obscuring the frame
+        content beneath it.  A very light semi-transparent fill is also
+        applied to make the field region easy to identify at a glance.
+        """
+        # Ensure the mask is the same spatial size as canvas
+        mh, mw = field_mask.shape[:2]
+        ch, cw = canvas.shape[:2]
+        if mh != ch or mw != cw:
+            field_mask = cv2.resize(
+                field_mask, (cw, ch), interpolation=cv2.INTER_NEAREST
+            )
+
+        # Semi-transparent fill: lime green at very low opacity
+        _FIELD_FILL = (0, 230, 80)        # BGR lime green
+        _FIELD_FILL_ALPHA = 0.08          # 8 % opacity
+        _FIELD_CONTOUR = (0, 255, 60)     # bright green
+        _FIELD_CONTOUR_THICK = 2
+
+        field_bool = field_mask > 0
+        if not field_bool.any():
+            return canvas
+
+        overlay = canvas.copy()
+        overlay[field_bool] = (
+            np.array(overlay[field_bool], dtype=np.float32) * (1 - _FIELD_FILL_ALPHA)
+            + np.array(_FIELD_FILL, dtype=np.float32) * _FIELD_FILL_ALPHA
+        ).astype(np.uint8)
+
+        # Find and draw contours
+        contours, _ = cv2.findContours(
+            field_mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(overlay, contours, -1, _FIELD_CONTOUR, _FIELD_CONTOUR_THICK)
+        canvas = overlay
+
+        return canvas
 
     def _draw_mask(
         self,
@@ -353,13 +445,23 @@ class Visualizer:
         color: tuple[int, int, int],
         team_label: int | None = None,
     ) -> None:
-        team_suffix = f" T{team_label}" if team_label is not None else ""
-        label = f"P{player_id}{team_suffix}"
+        # Adaptive font scale: proportional to the player bbox height so that
+        # tiny players (far away) get small text and close-up players get
+        # larger text.  Scale is clamped to [_LABEL_SCALE_MIN, _LABEL_SCALE_MAX].
+        bbox_h = max(1, int(bbox[3]) - int(bbox[1]))
+        font_scale = max(
+            _LABEL_SCALE_MIN,
+            min(_LABEL_SCALE_MAX, bbox_h / _LABEL_SCALE_REF),
+        )
+        thickness = max(1, round(font_scale * 2.0))
+
+        # Build label: player ID + team tag (1-indexed for readability: T1/T2)
+        team_tag = _TEAM_DISPLAY.get(team_label, "T?") if team_label is not None else ""
+        label = f"{player_id}" + (f" {team_tag}" if team_tag else "")
+
         x1, y1 = int(bbox[0]), int(bbox[1])
 
-        (tw, th), baseline = cv2.getTextSize(
-            label, _LABEL_FONT, _LABEL_SCALE, _LABEL_THICKNESS
-        )
+        (tw, th), baseline = cv2.getTextSize(label, _LABEL_FONT, font_scale, thickness)
         # Position label above the bbox; clamp to frame top
         lx, ly = x1, max(y1 - baseline - 4, th + baseline)
 
@@ -374,7 +476,7 @@ class Visualizer:
         # Text in white for contrast
         cv2.putText(
             canvas, label, (lx, ly),
-            _LABEL_FONT, _LABEL_SCALE, (255, 255, 255), _LABEL_THICKNESS,
+            _LABEL_FONT, font_scale, (255, 255, 255), thickness,
             cv2.LINE_AA,
         )
 
@@ -627,6 +729,90 @@ class Visualizer:
         canvas: np.ndarray,
         attractor: AttractorEstimate,
     ) -> None:
+        """Draw the attractor marker with style matching its *source*.
+
+        * ``source="ball"`` — gold concentric-ring crosshair labelled
+          **"Action Focus [BALL]"**.  Player velocity arrows already show team
+          pressure; this marker pins the confirmed ball position.
+
+        * ``source="vector_field"`` — confidence-coloured diamond (original
+          style), labelled **"Attractor"**.
+
+        * ``source="held"`` — dashed diamond outline (stale hold), as before.
+
+        Parameters
+        ----------
+        canvas:
+            BGR frame to annotate in-place.
+        attractor:
+            :class:`~segmentation_tracking.vector_field.AttractorEstimate`.
+        """
+        source = getattr(attractor, "source", "vector_field")
+        if source == "ball":
+            self._draw_ball_focus(canvas, attractor)
+        else:
+            self._draw_vf_attractor(canvas, attractor)
+
+    def _draw_ball_focus(
+        self,
+        canvas: np.ndarray,
+        attractor: AttractorEstimate,
+    ) -> None:
+        """Draw the ball-centric action-focus marker (gold crosshair / target).
+
+        Replaces the vector-field diamond when ``attractor.source == "ball"``.
+        Uses concentric rings + crosshair lines that visually communicate
+        "this is where the action is and the ball is confirmed here".
+        """
+        ax, ay = int(attractor.point[0]), int(attractor.point[1])
+        inner_r = 14
+        outer_r = 22
+        cross_len = outer_r + 10
+        color = _BALL_FOCUS_COLOR
+        ring_color = _BALL_FOCUS_RING_COLOR
+
+        overlay = canvas.copy()
+
+        # Outer ring (filled, semi-transparent)
+        cv2.circle(overlay, (ax, ay), outer_r, color, -1)
+        # Inner ring cutout (draw background colour to simulate a ring)
+        cv2.circle(overlay, (ax, ay), inner_r, (0, 0, 0), -1)
+        # Centre dot
+        cv2.circle(overlay, (ax, ay), 4, color, -1)
+
+        blended = cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0)
+        canvas[:] = blended
+
+        # Outer ring outline
+        cv2.circle(canvas, (ax, ay), outer_r, ring_color, 2, cv2.LINE_AA)
+        cv2.circle(canvas, (ax, ay), inner_r, ring_color, 1, cv2.LINE_AA)
+
+        # Crosshair lines (north-south, east-west)
+        gap = inner_r + 2
+        cv2.line(canvas, (ax, ay - cross_len), (ax, ay - gap), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax, ay + gap), (ax, ay + cross_len), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax - cross_len, ay), (ax - gap, ay), color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (ax + gap, ay), (ax + cross_len, ay), color, 2, cv2.LINE_AA)
+
+        # Label
+        label = "Action Focus [BALL]"
+        lx = ax + outer_r + 6
+        ly = ay - 4
+        (tw, th), bl = cv2.getTextSize(label, _LABEL_FONT, 0.50, 1)
+        cv2.rectangle(
+            canvas,
+            (lx - 2, ly - th - 2),
+            (lx + tw + 2, ly + bl + 2),
+            (20, 20, 20),
+            cv2.FILLED,
+        )
+        cv2.putText(canvas, label, (lx, ly), _LABEL_FONT, 0.50, color, 1, cv2.LINE_AA)
+
+    def _draw_vf_attractor(
+        self,
+        canvas: np.ndarray,
+        attractor: AttractorEstimate,
+    ) -> None:
         """Draw the vector-field attractor as a diamond marker with a label.
 
         The marker colour interpolates between :data:`_ATTRACTOR_LO_COLOR`
@@ -704,9 +890,9 @@ class Visualizer:
         # Centre dot
         cv2.circle(canvas, (ax, ay), 3, (255, 255, 255), -1, cv2.LINE_AA)
 
-        # Label
+        # Label — distinguish VF attractor from ball-sourced action focus
         held_tag = f" [HELD:{stale_frames}f]" if is_held else ""
-        label1 = f"Attractor (conf={conf:.2f}){held_tag}"
+        label1 = f"Attractor [VF] (conf={conf:.2f}){held_tag}"
         label2 = f"n={attractor.n_players}  spd={attractor.mean_speed:.1f}px/f"
         lx = ax + r + 6
         ly = ay - 4

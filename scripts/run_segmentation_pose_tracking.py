@@ -45,7 +45,8 @@ Optional flags::
     --tracker            botsort          Primary tracker: botsort or bytetrack
     --max_age            30               Max frames a track survives without detection
     --no_homography                       Disable camera-motion compensation
-    --team_colors                         Enable jersey-colour team classification
+    --team_colors                         Enable team classification (jersey colours)
+    --team_classifier    siglip           Team classification backend: siglip (default) | hue
     --n_teams            2                Number of team clusters (2 or 3)
     --team_refit_interval 30             Refit team clusters every N frames (default 30)
     --ball_patch_size    32               Ball DCF MOSSE template patch size (px)
@@ -55,7 +56,47 @@ Optional flags::
     --ball_conf_roi      0.05            Ball YOLO confidence for ROI re-detection (stage-2, FRoG-MOT)
     --ball_tracker       dcf              Ball tracker backend: dcf|cotracker
     --ball_ct_redetect   15               CoTracker ball: YOLO re-anchor interval (frames)
+    --ball_det_model     None             Dedicated ball detection model (ONNX/YOLO, e.g. weights/yolov26_ball_det.onnx)
+    --ball_det_conf      0.25            Confidence threshold for the dedicated ball detector
+    --no_attractor_use_ball              Disable ball-centric attractor (revert to pure vector-field mode)
     --codec              mp4v             FourCC codec for the output video
+
+Player-only tracking (out-of-the-box, no custom model required)::
+
+    --player_class_ids   0               Comma-separated YOLO class IDs to treat as players (default: 0 = COCO person).
+                                          Use with a sport-specific model to exclude referees:
+                                          e.g. --player_class_ids 0,1 (player + goalkeeper, not referee=2).
+    --field_mask_filter                  Enable green-grass HSV field mask to discard off-pitch persons
+                                          (spectators, coaches, camera operators). Zero training required.
+    --field_hsv_lo       36,40,40        HSV lower bound for field mask (H,S,V in OpenCV scale)
+    --field_hsv_hi       85,255,255      HSV upper bound for field mask
+    --field_min_overlap  0.3             Min fraction of bbox foot-region on green pixels to keep the person
+    --field_mask_interval 15             Recompute field mask every N frames
+
+SAM 3 backend (replaces SAM 2 segmentation with text-prompt driven SAM 3)::
+
+    --sam_backend        sam2            Segmentation backend: sam2 (default) | sam3
+    --sam3_model         weights/sam3/sam3.pt   SAM3 checkpoint path
+    --sam3_player_prompt "football player"       Text prompt for player detection
+    --sam3_ball_prompt   "sports ball"           Text prompt for ball detection (empty string to disable)
+    --sam3_field_prompt  ""                      Text prompt for field segmentation (empty = disabled)
+    --sam3_score_thresh  0.30            Minimum SAM3 object confidence to accept a detection
+    --sam3_float16                       Load SAM3 in float16 to halve GPU VRAM usage (~3 GiB vs ~6 GiB)
+    --no_sam3_fallback                   Disable automatic SAM2 fallback on SAM3 failure (default: fallback enabled)
+
+SAM 3 memory usage note::
+
+    Frames are extracted one-by-one via OpenCV (CPU) into a temporary
+    directory before being fed to SAM3.  SAM3 then reads frames from disk
+    one at a time (offload_video_to_cpu=True), so GPU VRAM is proportional
+    to the model size, not the video length.  This avoids the
+    ``CUDA out of memory`` error that occurred when the full video was
+    pre-loaded into GPU VRAM.
+
+    When SAM3 encounters any execution error (import failure, RuntimeError,
+    CUDA OOM, etc.) the pipeline automatically retries with SAM2 + YOLO so
+    the job always produces annotated output.  Use --no_sam3_fallback to
+    let SAM3 errors propagate instead.
 """
 
 from __future__ import annotations
@@ -74,9 +115,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from segmentation_tracking import (
     SegmentationTracker,
+    Sam3SegmentationTracker,
     Visualizer,
     associate_poses_with_tracks,
     TeamClassifier,
+    SiglipTeamClassifier,
+    create_team_classifier,
     PlayerVelocityTracker,
     KeypointVelocityTracker,
     estimate_attractor,
@@ -189,11 +233,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--show_attractor", action="store_true",
         help=(
-            "Draw per-player velocity arrows and the vector-field attractor — the point "
-            "that all player velocity rays collectively converge towards, which estimates "
-            "the ball position.  Displayed as a colour-coded diamond marker."
+            "Draw per-player velocity arrows and the action-focus attractor.  "
+            "When ball detection is reliable (default), the attractor IS the ball "
+            "position (shown as a gold crosshair target) and player velocity arrows "
+            "are still drawn to visualise team pressure.  When the ball is lost the "
+            "attractor falls back to the velocity-field convergence estimate "
+            "(diamond marker).  Use --no_attractor_use_ball to disable the ball-centric "
+            "mode and always show the velocity-field estimate."
         ),
     )
+    parser.add_argument(
+        "--no_attractor_use_ball", action="store_false", dest="attractor_use_ball",
+        help=(
+            "Disable ball-centric attractor mode.  When set, the attractor always "
+            "uses the vector-field convergence estimate (old behaviour) even when "
+            "ball detection is available.  Useful for comparing both modes."
+        ),
+    )
+    parser.set_defaults(attractor_use_ball=True)
     parser.add_argument(
         "--attractor_history", type=int, default=5,
         help=(
@@ -348,7 +405,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Improvement F: team colour clustering
     parser.add_argument(
         "--team_colors", action="store_true",
-        help="Enable jersey-colour K-means team classification",
+        help="Enable jersey-colour team classification",
+    )
+    parser.add_argument(
+        "--team_classifier", default="siglip", choices=["siglip", "hue"],
+        help=(
+            "Team classification backend (default: 'siglip').  "
+            "'siglip' uses google/siglip-base-patch16-224 vision embeddings + scikit-learn "
+            "KMeans for accurate team assignment that is robust to similar jersey colours.  "
+            "Player segmentation masks are used to blank out the background before "
+            "embedding for cleaner features.  Requires transformers, scikit-learn, torch.  "
+            "'hue' uses the lightweight HSV hue K-means classifier (no extra dependencies).  "
+            "Falls back to 'hue' automatically when SIGLIP dependencies are missing."
+        ),
     )
     parser.add_argument(
         "--n_teams", type=int, default=2,
@@ -422,10 +491,157 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ball_det_model", default=None,
+        help=(
+            "Optional path to a dedicated ball-detection model in ONNX or YOLO "
+            "format (e.g. 'weights/yolov26_ball_det.onnx').  When provided, this "
+            "model is used for both the global ball detection pass (stage-1) and "
+            "the ROI re-detection pass (stage-2) instead of the main YOLO model.  "
+            "The dedicated model must output class 0 as the ball class.  The main "
+            "YOLO result is kept as a fallback for stage-1 if the dedicated model "
+            "finds nothing."
+        ),
+    )
+    parser.add_argument(
+        "--ball_det_conf", type=float, default=0.25,
+        help=(
+            "Confidence threshold for the dedicated ball detector "
+            "(--ball_det_model, default: 0.25).  Ignored when --ball_det_model "
+            "is not set."
+        ),
+    )
+    parser.add_argument(
         "--codec", default="mp4v",
         help=(
             "FourCC video codec for the output file (default: mp4v). "
             "Use 'avc1' for H.264 if supported by your OpenCV build."
+        ),
+    )
+    # ── Player-only tracking ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--player_class_ids", default="0",
+        help=(
+            "Comma-separated YOLO class IDs to treat as players (default: '0' = "
+            "COCO person class).  Use this when you supply a sport-specific YOLO "
+            "model that distinguishes players from referees.  For example, with a "
+            "Roboflow football model that uses 0=player, 1=goalkeeper, 2=referee "
+            "you can pass '--player_class_ids 0,1' to track players and goalkeepers "
+            "but skip referees.  The ball class is managed separately and is not "
+            "affected by this setting."
+        ),
+    )
+    parser.add_argument(
+        "--field_mask_filter", action="store_true",
+        help=(
+            "Enable green-grass HSV field mask filtering.  When active, a colour "
+            "segmentation mask of the playing field is derived from each frame and "
+            "used to discard person detections whose feet are not on the grass — "
+            "eliminating spectators in the stands, coaches on the bench, camera "
+            "operators, and other off-pitch persons.  No custom model or training is "
+            "required.  Combine with --field_hsv_lo / --field_hsv_hi to tune the "
+            "HSV range for artificial turf or unusual lighting conditions."
+        ),
+    )
+    parser.add_argument(
+        "--field_hsv_lo", default="36,40,40",
+        help=(
+            "HSV lower bound for the field mask as 'H,S,V' (OpenCV scale: "
+            "H∈[0,180], S/V∈[0,255]; default: '36,40,40').  Used only when "
+            "--field_mask_filter is set."
+        ),
+    )
+    parser.add_argument(
+        "--field_hsv_hi", default="85,255,255",
+        help=(
+            "HSV upper bound for the field mask as 'H,S,V' (default: '85,255,255'). "
+            "Used only when --field_mask_filter is set."
+        ),
+    )
+    parser.add_argument(
+        "--field_min_overlap", type=float, default=0.3,
+        help=(
+            "Minimum fraction of the bounding-box foot region that must fall on "
+            "green pixels to keep a tracked person (default: 0.3).  Lower values "
+            "retain players near the sideline; higher values are more aggressive."
+        ),
+    )
+    parser.add_argument(
+        "--field_mask_interval", type=int, default=15,
+        help=(
+            "Recompute the field mask every N frames (default: 15).  "
+            "Lower values adapt faster to camera panning or lighting changes; "
+            "higher values are faster.  Used only when --field_mask_filter is set."
+        ),
+    )
+    # ── SAM 3 backend ────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--sam_backend", default="sam2", choices=["sam2", "sam3"],
+        help=(
+            "Segmentation backend to use for player masking (default: 'sam2').  "
+            "'sam3' switches to the SAM 3 text-prompt-driven tracker "
+            "(Sam3SegmentationTracker) which requires the 'sam3' Python package "
+            "and a SAM3 checkpoint.  See weights/sam3/README.md for setup "
+            "instructions.  When 'sam3' is selected the --det_model / --sam_model "
+            "arguments are ignored and replaced by the --sam3_* flags below."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_model", default="weights/sam3/sam3.pt",
+        help=(
+            "Path to the SAM3 checkpoint file (default: 'weights/sam3/sam3.pt').  "
+            "Used only when --sam_backend sam3 is set."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_player_prompt", default="football player",
+        help=(
+            "Text prompt describing the objects to track as players "
+            "(default: 'football player').  SAM3 detects and tracks all instances "
+            "of this concept across the video.  Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_ball_prompt", default="sports ball",
+        help=(
+            "Text prompt for the ball (default: 'sports ball').  Pass an empty "
+            "string ('') to disable SAM3-based ball detection.  "
+            "Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_field_prompt", default="",
+        help=(
+            "Text prompt for the playing field (default: '' = disabled).  "
+            "When non-empty (e.g. 'football pitch'), SAM3 segments the field and "
+            "the result is stored in SegmentationResult.field_mask and visualised "
+            "as a lime-green boundary overlay.  "
+            "Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_score_thresh", type=float, default=0.30,
+        help=(
+            "Minimum SAM3 object confidence score to accept a detection "
+            "(default: 0.30).  Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--sam3_float16", action="store_true", default=False,
+        help=(
+            "Convert the SAM3 model to float16 immediately after loading to "
+            "roughly halve its GPU VRAM footprint (~3 GiB vs ~6 GiB in float32). "
+            "Recommended when GPU memory is limited or shared with other models. "
+            "Used only with --sam_backend sam3."
+        ),
+    )
+    parser.add_argument(
+        "--no_sam3_fallback", action="store_true", default=False,
+        help=(
+            "Disable the automatic SAM2 + YOLO fallback that runs when SAM3 "
+            "encounters an error (ImportError, RuntimeError, CUDA OOM, …).  "
+            "By default the pipeline transparently retries with SAM2 so the job "
+            "always produces output.  Pass this flag to let SAM3 errors propagate "
+            "and crash the process — useful when debugging SAM3 itself."
         ),
     )
     return parser.parse_args(argv)
@@ -550,33 +766,82 @@ def run_pipeline(args: argparse.Namespace) -> None:
     output_dir = Path(args.output).parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # -- Step 1: Segmentation + tracking (BoT-SORT + SAM2) --------------------
+    # -- Step 1: Segmentation + tracking (BoT-SORT + SAM2 or SAM3) ------------
     logger.info(
-        "=== Step 1: Player segmentation and tracking (%s + SAM2) ===",
-        args.tracker.upper(),
+        "=== Step 1: Player segmentation and tracking (backend=%s) ===",
+        args.sam_backend.upper(),
     )
-    tracker = SegmentationTracker(
-        sam_model_path=args.sam_model,
-        det_model_path=args.det_model,
-        device=args.device,
-        conf_threshold=args.conf,
-        iou_threshold=args.iou,
-        redetect_interval=args.redetect_interval,
-        tracker=args.tracker,
-        max_age=args.max_age,
-        use_homography=not args.no_homography,
-        ball_patch_size=args.ball_patch_size,
-        ball_search_radius=args.ball_search_radius,
-        ball_psr_threshold=args.ball_psr_threshold,
-        ball_conf_threshold=args.ball_conf,
-        ball_conf_roi=args.ball_conf_roi,
-        ball_tracker_type=args.ball_tracker,
-        ball_cotracker_model=args.cotracker_model,
-        ball_cotracker_checkpoint=args.cotracker_checkpoint,
-        ball_cotracker_device=args.device,
-        ball_cotracker_redetect_interval=args.ball_ct_redetect,
-    )
-    seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+
+    def _build_sam2_tracker() -> SegmentationTracker:
+        """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
+        return SegmentationTracker(
+            sam_model_path=args.sam_model,
+            det_model_path=args.det_model,
+            device=args.device,
+            conf_threshold=args.conf,
+            iou_threshold=args.iou,
+            redetect_interval=args.redetect_interval,
+            tracker=args.tracker,
+            max_age=args.max_age,
+            use_homography=not args.no_homography,
+            ball_patch_size=args.ball_patch_size,
+            ball_search_radius=args.ball_search_radius,
+            ball_psr_threshold=args.ball_psr_threshold,
+            ball_conf_threshold=args.ball_conf,
+            ball_conf_roi=args.ball_conf_roi,
+            ball_tracker_type=args.ball_tracker,
+            ball_cotracker_model=args.cotracker_model,
+            ball_cotracker_checkpoint=args.cotracker_checkpoint,
+            ball_cotracker_device=args.device,
+            ball_cotracker_redetect_interval=args.ball_ct_redetect,
+            ball_det_model_path=args.ball_det_model,
+            ball_det_conf=args.ball_det_conf,
+            player_class_ids=[int(x) for x in args.player_class_ids.split(",") if x.strip()],
+            field_mask_filter=args.field_mask_filter,
+            field_hsv_lo=tuple(int(x) for x in args.field_hsv_lo.split(",")),  # type: ignore[arg-type]
+            field_hsv_hi=tuple(int(x) for x in args.field_hsv_hi.split(",")),  # type: ignore[arg-type]
+            field_min_overlap=args.field_min_overlap,
+            field_mask_interval=args.field_mask_interval,
+        )
+
+    if args.sam_backend == "sam3":
+        # SAM3 text-prompt-driven tracker with automatic SAM2 fallback
+        logger.info(
+            "SAM3 tracker: player='%s', ball='%s', field='%s'",
+            args.sam3_player_prompt,
+            args.sam3_ball_prompt or "(disabled)",
+            args.sam3_field_prompt or "(disabled)",
+        )
+        try:
+            tracker: SegmentationTracker | Sam3SegmentationTracker = Sam3SegmentationTracker(
+                sam3_model_path=args.sam3_model,
+                device=args.device,
+                player_text_prompt=args.sam3_player_prompt,
+                ball_text_prompt=args.sam3_ball_prompt or None,
+                field_text_prompt=args.sam3_field_prompt or None,
+                score_threshold=args.sam3_score_thresh,
+                use_float16=args.sam3_float16,
+            )
+            seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+        except Exception as sam3_exc:  # noqa: BLE001
+            logger.warning(
+                "SAM3 processing failed: %s\n"
+                "  Error type : %s\n"
+                "  Falling back to SAM2 + YOLO pipeline%s",
+                sam3_exc,
+                type(sam3_exc).__name__,
+                "" if not getattr(args, "no_sam3_fallback", False)
+                else "  (fallback disabled — re-raising)",
+            )
+            if getattr(args, "no_sam3_fallback", False):
+                raise
+            logger.info("Building SAM2 + YOLO fallback tracker …")
+            tracker = _build_sam2_tracker()
+            seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+    else:
+        # Default SAM2 + YOLO BoT-SORT tracker
+        tracker = _build_sam2_tracker()
+        seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))
 
     # -- Step 2: Pose estimation -----------------------------------------------
@@ -587,10 +852,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
     pose_estimator = _build_pose_estimator(args)
 
     # -- Team colour classifier (optional) ------------------------------------
-    team_classifier: TeamClassifier | None = None
+    team_classifier: TeamClassifier | SiglipTeamClassifier | None = None
     if args.team_colors:
-        logger.info("Team colour classification enabled (n_teams=%d)", args.n_teams)
-        team_classifier = TeamClassifier(n_teams=args.n_teams)
+        _tc_backend = getattr(args, "team_classifier", "siglip")
+        logger.info(
+            "Team classification enabled (backend=%s, n_teams=%d)",
+            _tc_backend,
+            args.n_teams,
+        )
+        team_classifier = create_team_classifier(
+            backend=_tc_backend,
+            n_teams=args.n_teams,
+            device=args.device,
+        )
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -680,7 +954,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if team_classifier is not None:
             for pt in player_tracks:
                 crop = TeamClassifier.extract_torso_crop(frame, pt.bbox)
-                team_classifier.update(pt.id, crop)
+                # Pass the player mask to SIGLIP so background is blanked out;
+                # HSV classifier ignores the mask keyword argument.
+                team_classifier.update(pt.id, crop, mask=pt.mask)
 
             # Refit at configured interval; try fast assignment for new players otherwise
             if frame_idx % args.team_refit_interval == 0:
@@ -745,20 +1021,29 @@ def run_pipeline(args: argparse.Namespace) -> None:
             # Prefer the ball when detected; fall back to the previous smoothed
             # attractor position to avoid losing the weighting on missed frames.
             anchor_pt: tuple[float, float] | None = None
+            ball_center_pt: tuple[float, float] | None = None
             if ball_track is not None:
                 anchor_pt = ball_track.center
+                if args.attractor_use_ball:
+                    ball_center_pt = ball_track.center
             elif _prev_attractor_pt is not None:
                 anchor_pt = _prev_attractor_pt
 
             raw_attractor = estimate_attractor(
                 direction_vectors,
                 frame_shape=(frame_h, frame_w),
+                # Ball-centric fast-path: when ball is detected and
+                # --attractor_use_ball is set (default), the expensive
+                # vector-field computation is bypassed and the exact ball
+                # position is returned with confidence=1.0.
+                ball_center=ball_center_pt,
                 anchor_point=anchor_pt,
                 distance_sigma=args.attractor_dist_sigma,
                 directional_weight=args.attractor_directional,
             )
 
-            # Apply Kalman smoother (or use raw directly if smoothing disabled)
+            # Apply Kalman smoother (or use raw directly if smoothing disabled).
+            # Ball-sourced estimates pass through without Kalman lag.
             if attractor_smoother is not None:
                 attractor = attractor_smoother.update(
                     raw_attractor, frame_shape=(frame_h, frame_w)
@@ -786,6 +1071,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             velocities=velocities,
             attractor=attractor,
             ct_trajectories=ct_trajectories,
+            field_mask=seg_result.field_mask,
         )
         writer.write(annotated)
 
