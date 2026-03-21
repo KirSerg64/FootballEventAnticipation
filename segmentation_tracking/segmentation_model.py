@@ -52,7 +52,7 @@ Architecture (updated)
 
 Public API
 ~~~~~~~~~~
-``SegmentationTracker.process_video(video_path, max_frames) -> list[SegmentationResult]``
+``SegmentationTracker.process_video(video_path, max_frames) -> list[TrackerState]``
 """
 
 from __future__ import annotations
@@ -61,13 +61,15 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any
 
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+import torch
+import supervision as sv
 
 from segmentation_tracking.ball_kalman import BallDCFTracker, BallKalmanFilter, BallCoTrackerTracker
+from segmentation_tracking.sam2_tracker import SAM2Tracker
 
 logger = logging.getLogger(__name__)
 
@@ -107,39 +109,38 @@ _BYTETRACK_TEMPLATE = (
     "fuse_score: false\n"
 )
 
+SAM2_CHECKPOINT = "checkpoints/sam2.1_hiera_large.pt"
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SegmentationResult:
-    """Per-frame output of :class:`SegmentationTracker`.
+class TrackerState:
+    """Per-frame output of :class:`TrackerState`.
 
     Attributes
     ----------
     frame_index:
         0-based index of the video frame.
-    player_ids:
-        List of persistent player identifiers (one per detected player).
-    player_masks:
-        Binary masks, shape ``(H, W)``, dtype ``uint8`` (0/255), one per player.
-    player_bboxes:
-        Bounding boxes ``[x1, y1, x2, y2]`` (float32), one per player.
-    ball_mask:
-        Binary mask for the ball, or *None* if no ball was detected.
-    ball_bbox:
-        Bounding box for the ball ``[x1, y1, x2, y2]``, or *None*.
+    tracks: sv.Detections | None
+        Player tracks for this frame, or *None* if not yet populated.  
+        The  ``tracker_id`` field contains the persistent ID assigned by SAM2Tracker or BoT-SORT, 0 for untracked detections, and *-1* for the ball. 
+        The ``xyxy`` field contains the bounding box; 
+        the ``mask`` field contains the SAM2 segmentation mask for each track.
     ball_center:
         ``(cx, cy)`` pixel position of the ball centre, or *None*.
     """
 
     frame_index: int = 0
-    player_ids: list[int] = field(default_factory=list)
-    player_masks: list[np.ndarray] = field(default_factory=list)
-    player_bboxes: list[np.ndarray] = field(default_factory=list)
-    ball_mask: np.ndarray | None = None
-    ball_bbox: np.ndarray | None = None
+    tracks: sv.Detections | None = None
+
+    # player_ids: list[int] = field(default_factory=list)
+    # player_masks: list[np.ndarray] = field(default_factory=list)
+    # player_bboxes: list[np.ndarray] = field(default_factory=list)
+    # ball_mask: np.ndarray | None = None
+    # ball_bbox: np.ndarray | None = None
     ball_center: tuple[float, float] | None = None
     ball_source: str = "none"
     """Source of the ball position for this frame.
@@ -230,7 +231,8 @@ class SegmentationTracker:
 
     def __init__(
         self,
-        sam_model_path: str = "sam2.1_b.pt",
+        sam_model_config: str = SAM2_CONFIG,
+        sam_model_checkpoint: str = SAM2_CHECKPOINT,
         det_model_path: str = "yolo11x.pt",
         device: str = "cuda",
         conf_threshold: float = 0.25,
@@ -250,7 +252,8 @@ class SegmentationTracker:
         ball_cotracker_device: str = "cuda",
         ball_cotracker_redetect_interval: int = 15,
     ) -> None:
-        self.sam_model_path = sam_model_path
+        self._sam_config = sam_model_config
+        self._sam_checkpoint = sam_model_checkpoint
         self.det_model_path = det_model_path
         self.device = device
         self.conf_threshold = conf_threshold
@@ -263,7 +266,7 @@ class SegmentationTracker:
         self.ball_conf_roi = ball_conf_roi
 
         self._detector = None                # lazy-loaded YOLO model
-        self._sam = None                     # lazy-loaded SAM2VideoPredictor
+        self._predictor = None               # lazy-loaded SAM2VideoPredictor
         self._next_player_id: int = 1
 
         _btt = ball_tracker_type.lower()
@@ -280,7 +283,7 @@ class SegmentationTracker:
                 search_radius=ball_search_radius,
                 psr_threshold=ball_psr_threshold,
             )
-
+        self._sam_tracker = None        
         # Path to customised tracker YAML written at init time
         self._tracker_config_path: str | None = None
         self._write_tracker_config()
@@ -320,24 +323,15 @@ class SegmentationTracker:
             self._detector = YOLO(self.det_model_path)
         return self._detector
 
-    def _get_sam_predictor(self):
-        """Return an initialised SAM2VideoPredictor instance."""
-        if self._sam is None:
-            from ultralytics.models.sam.predict import SAM2VideoPredictor
-            logger.info("Loading SAM2VideoPredictor: %s", self.sam_model_path)
-            self._sam = SAM2VideoPredictor(
-                overrides=dict(
-                    model=self.sam_model_path,
-                    device=self.device,
-                    conf=self.conf_threshold,
-                    task="segment",
-                    mode="predict",
-                    imgsz=1024,
-                    save=False,
-                    verbose=False,
-                )
-            )
-        return self._sam
+    def _get_sam_predictor(self) -> SAM2Tracker:
+        """Return an initialised :class:`SAM2Tracker` instance (lazy-loaded)."""
+        if self._predictor is None:
+            from sam2.build_sam import build_sam2_camera_predictor
+
+            logger.info("Loading SAM2 model: %s", self._sam_checkpoint)
+            self._predictor = build_sam2_camera_predictor(self._sam_config, self._sam_checkpoint)
+            self._sam_tracker = SAM2Tracker(self._predictor)
+        return self._sam_tracker
 
     # -- BoT-SORT tracking ----------------------------------------------------
 
@@ -703,112 +697,189 @@ class SegmentationTracker:
 
     # -- SAM2 helpers ---------------------------------------------------------
 
-    def _run_sam_stream(
+    # -- Core processing loop -------------------------------------------------
+
+    def process_video(
         self,
         video_path: str,
-        max_frames: int | None,
-        init_player_bboxes: list[np.ndarray],
-    ) -> list[Any]:
-        """Stream SAM2VideoPredictor results for the whole video.
+        max_frames: int | None = None,
+    ) -> list[TrackerState]:
+        """Process a video and return per-frame segmentation results.
 
-        Returns an ordered list of result objects (one per processed frame),
-        or an empty list if the predictor fails.
+        Steps
+        -----
+        1. Detect players in frame 0 with YOLO; seed ``SAM2Tracker`` with those
+           bounding boxes.
+        2. For every frame: run BoT-SORT to get stable player IDs, run
+           ``SAM2Tracker.track`` to get pixel-accurate masks, then
+           Hungarian-match the two sets of results so the final output has
+           BoT-SORT ID stability with SAM2 mask quality.
+        3. Ball is tracked with detection-first correlation (instant kick
+           response) with ROI fallback and MOSSE gap-fill; appended to
+           ``TrackerState.tracks`` with ``tracker_id == -1``.
+
+        Parameters
+        ----------
+        video_path:
+            Path to the input video file.
+        max_frames:
+            If set, process at most this many frames.
+
+        Returns
+        -------
+        list[TrackerState]
+            One :class:`TrackerState` per processed frame, in order.
         """
-        predictor = self._get_sam_predictor()
-        init_bboxes_arr = (
-            np.stack(init_player_bboxes, axis=0).astype(np.float32)
-            if init_player_bboxes
-            else None
+        self._next_player_id = 1
+        self._ball_tracker.reset()
+
+        # -- Read first frame -------------------------------------------------
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+        ok, first_frame = cap.read()
+        if not ok:
+            raise ValueError("Video is empty")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames:
+            total_frames = min(total_frames, max_frames)
+        cap.release()
+
+        logger.info("Video: %s (%d frames to process)", video_path, total_frames)
+
+        # -- Detect initial players on frame 0 (seed for SAM2) ----------------
+        init_player_bboxes, _ = self._detect_frame(first_frame)
+        if not init_player_bboxes:
+            logger.warning(
+                "No players detected in the first frame; SAM2 will have no seeds."
+            )
+        logger.info(
+            "Seeding SAM2Tracker with %d player bboxes from frame 0",
+            len(init_player_bboxes),
         )
-        try:
-            sam_stream = predictor.predict(
-                source=video_path,
-                bboxes=init_bboxes_arr,
-                stream=True,
-                verbose=False,
-            )
-            sam_results: list[Any] = []
-            for i, r in enumerate(sam_stream):
-                sam_results.append(r)
-                if max_frames and i + 1 >= max_frames:
-                    break
-            return sam_results
-        except Exception as exc:
-            logger.error(
-                "SAM2VideoPredictor failed (%s). Falling back to BoT-SORT bbox masks.",
-                exc,
-            )
-            return []
 
-    def _extract_sam_masks(
-        self,
-        sam_result: Any,
-        frame_shape: tuple[int, ...],
-    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        """Extract ``(masks, bboxes)`` lists from a SAM2 result object."""
-        masks: list[np.ndarray] = []
-        bboxes: list[np.ndarray] = []
-        if sam_result is None or sam_result.masks is None:
-            return masks, bboxes
-        orig_h, orig_w = frame_shape[:2]
-        for mask_t in sam_result.masks.data:
-            mask_np = mask_t.cpu().numpy().astype(np.uint8) * 255
-            mh, mw = mask_np.shape
-            if mh != orig_h or mw != orig_w:
-                mask_np = cv2.resize(
-                    mask_np, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+        sam_tracker = self._get_sam_predictor()
+        if init_player_bboxes:
+            init_detections = sv.Detections(
+                xyxy=np.array(init_player_bboxes, dtype=np.float32)
+            )
+            sam_tracker.prompt_first_frame(first_frame, init_detections)
+
+        # -- Single streaming pass: BoT-SORT + SAM2 per frame -----------------
+        logger.info(
+            "=== Streaming BoT-SORT (%s) + SAM2 pass ===", self.tracker
+        )
+        results: list[TrackerState] = []
+        prev_frame: np.ndarray | None = None
+
+        cap2 = cv2.VideoCapture(video_path)
+        for frame_idx in range(total_frames):
+            ok2, frame = cap2.read()
+            if not ok2:
+                break
+
+            seg_result = TrackerState(frame_index=frame_idx)
+
+            # Camera-motion compensation homography
+            homography: np.ndarray | None = None
+            if self.use_homography and prev_frame is not None:
+                homography = self._estimate_homography(prev_frame, frame)
+
+            # BoT-SORT tracking + ball detection
+            bot_tracks, ball_bbox_raw = self._track_frame(frame)
+
+            # SAM2 streaming masks: frame 0 is the seed frame (no output),
+            # tracking starts from frame 1 onward.
+            if sam_tracker._prompted and frame_idx > 0:
+                sam_detections = sam_tracker.track(frame)
+            else:
+                sam_detections = sv.Detections.empty()
+
+            # Merge BoT-SORT IDs with SAM2 masks, or fall back to YOLO-only
+            if bot_tracks:
+                seg_result = self._merge_bot_sam_results(
+                    bot_tracks, sam_detections, frame, seg_result
                 )
-            if not mask_np.any():
-                continue
-            bbox = self._mask_to_bbox(mask_np)
-            if bbox is None:
-                continue
-            masks.append(mask_np)
-            bboxes.append(bbox)
-        return masks, bboxes
+            else:
+                seg_result = self._fallback_detect(
+                    frame, frame_idx, results, seg_result, homography
+                )
 
-    # -- Merge BoT-SORT tracks with SAM2 masks --------------------------------
+            # Re-detection for late-entering players
+            if (
+                self.redetect_interval > 0
+                and frame_idx > 0
+                and frame_idx % self.redetect_interval == 0
+            ):
+                seg_result = self._redetect_new_players(frame, seg_result, homography)
+
+            # Ball correlation tracker (detection-first + MOSSE gap fill)
+            seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
+
+            results.append(seg_result)
+            prev_frame = frame
+
+            if (frame_idx + 1) % 50 == 0:
+                logger.info("Processed %d / %d frames", frame_idx + 1, total_frames)
+
+        cap2.release()
+        logger.info("Finished processing %d frames", len(results))
+        return results
 
     def _merge_bot_sam_results(
         self,
         bot_tracks: dict[int, np.ndarray],
-        sam_masks: list[np.ndarray],
-        sam_bboxes: list[np.ndarray],
+        sam_detections: sv.Detections,
         frame: np.ndarray,
-        seg_result: SegmentationResult,
-    ) -> SegmentationResult:
+        seg_result: TrackerState,
+    ) -> TrackerState:
         """Combine BoT-SORT IDs with SAM2 masks via Hungarian matching.
 
         For each BoT-SORT track a matching SAM2 mask is sought.  Tracks with
         no sufficiently overlapping mask fall back to a rectangle mask.
         SAM2 masks with no matching BoT-SORT track are discarded.
+        The result is stored in ``seg_result.tracks`` as an ``sv.Detections``
+        with ``tracker_id`` set to the BoT-SORT player ID.
         """
         track_ids = list(bot_tracks.keys())
         track_bboxes = [bot_tracks[tid] for tid in track_ids]
 
-        if sam_bboxes:
+        all_xyxy: list[np.ndarray] = []
+        all_masks: list[np.ndarray] = []
+        all_tids: list[int] = []
+
+        has_sam = len(sam_detections) > 0 and sam_detections.mask is not None
+        if has_sam:
+            sam_bboxes = [sam_detections.xyxy[i] for i in range(len(sam_detections))]
+            sam_masks = [sam_detections.mask[i] for i in range(len(sam_detections))]
             matches = self._hungarian_match_bboxes(track_bboxes, sam_bboxes)
             matched_tracks = {ti for ti, _ in matches}
 
             # Matched: BoT-SORT bbox + SAM2 mask
             for ti, si in matches:
-                seg_result.player_ids.append(track_ids[ti])
-                seg_result.player_masks.append(sam_masks[si])
-                seg_result.player_bboxes.append(track_bboxes[ti])
+                all_xyxy.append(track_bboxes[ti])
+                all_masks.append(sam_masks[si].astype(bool))
+                all_tids.append(track_ids[ti])
 
-            # Unmatched BoT-SORT tracks: rectangle mask
+            # Unmatched BoT-SORT tracks: rectangle mask fallback
             for ti, (tid, bbox) in enumerate(zip(track_ids, track_bboxes)):
                 if ti not in matched_tracks:
-                    seg_result.player_ids.append(tid)
-                    seg_result.player_masks.append(self._rect_mask(bbox, frame.shape))
-                    seg_result.player_bboxes.append(bbox)
+                    all_xyxy.append(bbox)
+                    all_masks.append(self._rect_mask(bbox, frame.shape).astype(bool))
+                    all_tids.append(tid)
         else:
             # No SAM2 masks: rectangle masks for all BoT-SORT tracks
             for tid, bbox in zip(track_ids, track_bboxes):
-                seg_result.player_ids.append(tid)
-                seg_result.player_masks.append(self._rect_mask(bbox, frame.shape))
-                seg_result.player_bboxes.append(bbox)
+                all_xyxy.append(bbox)
+                all_masks.append(self._rect_mask(bbox, frame.shape).astype(bool))
+                all_tids.append(tid)
 
+        if all_xyxy:
+            seg_result.tracks = sv.Detections(
+                xyxy=np.array(all_xyxy, dtype=np.float32),
+                mask=np.array(all_masks, dtype=bool),
+                tracker_id=np.array(all_tids, dtype=np.int32),
+            )
         return seg_result
 
     @staticmethod
@@ -830,18 +901,20 @@ class SegmentationTracker:
         self,
         frame: np.ndarray,
         frame_idx: int,
-        previous_results: list[SegmentationResult],
-        seg_result: SegmentationResult,
+        previous_results: list[TrackerState],
+        seg_result: TrackerState,
         homography: np.ndarray | None = None,
-    ) -> SegmentationResult:
+    ) -> TrackerState:
         """YOLO-only fallback with Hungarian matching + homography compensation."""
         player_bboxes, _ = self._detect_frame(frame)
         existing_bboxes: list[np.ndarray] = []
         existing_ids: list[int] = []
         if previous_results:
             prev = previous_results[-1]
-            existing_bboxes = prev.player_bboxes
-            existing_ids = prev.player_ids
+            if prev.tracks is not None and prev.tracks.tracker_id is not None:
+                player_mask = prev.tracks.tracker_id != -1
+                existing_bboxes = list(prev.tracks.xyxy[player_mask])
+                existing_ids = list(prev.tracks.tracker_id[player_mask].astype(int))
         assigned_ids = self._assign_new_player_ids(
             player_bboxes,
             existing_bboxes,
@@ -849,38 +922,65 @@ class SegmentationTracker:
             homography=homography,
             frame_shape=frame.shape,
         )
+        all_xyxy: list[np.ndarray] = []
+        all_masks: list[np.ndarray] = []
+        all_tids: list[int] = []
         for pid, bbox in zip(assigned_ids, player_bboxes):
-            seg_result.player_ids.append(pid)
-            seg_result.player_masks.append(self._rect_mask(bbox, frame.shape))
-            seg_result.player_bboxes.append(bbox)
+            all_xyxy.append(bbox)
+            all_masks.append(self._rect_mask(bbox, frame.shape).astype(bool))
+            all_tids.append(pid)
+        if all_xyxy:
+            seg_result.tracks = sv.Detections(
+                xyxy=np.array(all_xyxy, dtype=np.float32),
+                mask=np.array(all_masks, dtype=bool),
+                tracker_id=np.array(all_tids, dtype=np.int32),
+            )
         return seg_result
 
     def _redetect_new_players(
         self,
         frame: np.ndarray,
-        seg_result: SegmentationResult,
+        seg_result: TrackerState,
         homography: np.ndarray | None = None,
-    ) -> SegmentationResult:
+    ) -> TrackerState:
         """Detect players not yet tracked and assign fresh IDs."""
         new_bboxes, _ = self._detect_frame(frame)
         if not new_bboxes:
             return seg_result
 
-        existing = seg_result.player_bboxes
+        existing_bboxes: list[np.ndarray] = []
+        if seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
+            player_mask = seg_result.tracks.tracker_id != -1
+            existing_bboxes = list(seg_result.tracks.xyxy[player_mask])
+
         existing_warped = (
-            self._warp_bboxes(existing, homography, frame.shape)
-            if homography is not None and existing
-            else existing
+            self._warp_bboxes(existing_bboxes, homography, frame.shape)
+            if homography is not None and existing_bboxes
+            else existing_bboxes
         )
 
+        new_xyxy: list[np.ndarray] = []
+        new_masks: list[np.ndarray] = []
+        new_tids: list[int] = []
         for nb in new_bboxes:
             if any(self._bbox_iou(nb, eb) > self.iou_threshold for eb in existing_warped):
                 continue  # already tracked
-            pid = self._next_player_id
+            new_xyxy.append(nb)
+            new_masks.append(self._rect_mask(nb, frame.shape).astype(bool))
+            new_tids.append(self._next_player_id)
             self._next_player_id += 1
-            seg_result.player_ids.append(pid)
-            seg_result.player_masks.append(self._rect_mask(nb, frame.shape))
-            seg_result.player_bboxes.append(nb)
+
+        if new_xyxy:
+            new_det = sv.Detections(
+                xyxy=np.array(new_xyxy, dtype=np.float32),
+                mask=np.array(new_masks, dtype=bool),
+                tracker_id=np.array(new_tids, dtype=np.int32),
+            )
+            seg_result.tracks = (
+                sv.Detections.merge([seg_result.tracks, new_det])
+                if seg_result.tracks is not None
+                else new_det
+            )
 
         return seg_result
 
@@ -890,8 +990,8 @@ class SegmentationTracker:
         self,
         frame: np.ndarray,
         ball_bbox: np.ndarray | None,
-        seg_result: SegmentationResult,
-    ) -> SegmentationResult:
+        seg_result: TrackerState,
+    ) -> TrackerState:
         """Update ball tracker and populate *seg_result* ball fields.
 
         Two-stage detection strategy (FRoG-MOT):
@@ -944,9 +1044,24 @@ class SegmentationTracker:
             ball_mask, ball_center = self._segment_ball_from_center(
                 frame, cx, cy, ball_bbox
             )
-            seg_result.ball_mask = ball_mask
-            seg_result.ball_bbox = ball_bbox  # None when position is predicted
             seg_result.ball_center = ball_center
+            # Build bbox from the detected box or create a fixed-size placeholder
+            if ball_bbox is not None:
+                bxyxy = ball_bbox.astype(np.float32)
+            else:
+                bxyxy = np.array(
+                    [cx - 15.0, cy - 15.0, cx + 15.0, cy + 15.0], dtype=np.float32
+                )
+            ball_det = sv.Detections(
+                xyxy=bxyxy[None],
+                mask=np.array([ball_mask.astype(bool)]),
+                tracker_id=np.array([-1], dtype=np.int32),
+            )
+            seg_result.tracks = (
+                sv.Detections.merge([seg_result.tracks, ball_det])
+                if seg_result.tracks is not None
+                else ball_det
+            )
 
         return seg_result
 
@@ -956,17 +1071,20 @@ class SegmentationTracker:
         self,
         video_path: str,
         max_frames: int | None = None,
-    ) -> list[SegmentationResult]:
+    ) -> list[TrackerState]:
         """Process a video and return per-frame segmentation results.
 
         Steps
         -----
-        1. Run SAM2VideoPredictor over the video (seeded with YOLO detections
-           from frame 0) to collect pixel-accurate masks.
-        2. In a second pass, run BoT-SORT per frame to obtain stable player IDs.
-        3. For each frame, Hungarian-match BoT-SORT bboxes to SAM2 mask bboxes
-           to combine ID stability with mask quality.
-        4. Apply ball detection-first correlation tracking (instant kick response).
+        1. Detect players in frame 0 with YOLO; seed ``SAM2Tracker`` with those
+           bounding boxes.
+        2. For every frame: run BoT-SORT to get stable player IDs, run
+           ``SAM2Tracker.track`` to get pixel-accurate masks, then
+           Hungarian-match the two sets of results so the final output has
+           BoT-SORT ID stability with SAM2 mask quality.
+        3. Ball is tracked with detection-first correlation (instant kick
+           response) with ROI fallback and MOSSE gap-fill; appended to
+           ``TrackerState.tracks`` with ``tracker_id == -1``.
 
         Parameters
         ----------
@@ -977,8 +1095,8 @@ class SegmentationTracker:
 
         Returns
         -------
-        list[SegmentationResult]
-            One :class:`SegmentationResult` per processed frame, in order.
+        list[TrackerState]
+            One :class:`TrackerState` per processed frame, in order.
         """
         self._next_player_id = 1
         self._ball_tracker.reset()
@@ -1004,20 +1122,22 @@ class SegmentationTracker:
                 "No players detected in the first frame; SAM2 will have no seeds."
             )
         logger.info(
-            "Seeding SAM2VideoPredictor with %d player prompts from frame 0",
+            "Seeding SAM2Tracker with %d player bboxes from frame 0",
             len(init_player_bboxes),
         )
 
-        # -- Pass 1: collect SAM2 masks for the whole video -------------------
-        logger.info("=== SAM2 mask streaming pass ===")
-        sam_results_all = self._run_sam_stream(video_path, max_frames, init_player_bboxes)
-        logger.info("SAM2 pass complete: %d frame results", len(sam_results_all))
+        sam_tracker = self._get_sam_predictor()
+        if init_player_bboxes:
+            init_detections = sv.Detections(
+                xyxy=np.array(init_player_bboxes, dtype=np.float32)
+            )
+            sam_tracker.prompt_first_frame(first_frame, init_detections)
 
-        # -- Pass 2: BoT-SORT tracking + merge --------------------------------
+        # -- Single streaming pass: BoT-SORT + SAM2 per frame -----------------
         logger.info(
-            "=== BoT-SORT (%s) tracking + association pass ===", self.tracker
+            "=== Streaming BoT-SORT (%s) + SAM2 pass ===", self.tracker
         )
-        results: list[SegmentationResult] = []
+        results: list[TrackerState] = []
         prev_frame: np.ndarray | None = None
 
         cap2 = cv2.VideoCapture(video_path)
@@ -1026,7 +1146,7 @@ class SegmentationTracker:
             if not ok2:
                 break
 
-            seg_result = SegmentationResult(frame_index=frame_idx)
+            seg_result = TrackerState(frame_index=frame_idx)
 
             # Camera-motion compensation homography
             homography: np.ndarray | None = None
@@ -1036,18 +1156,17 @@ class SegmentationTracker:
             # BoT-SORT tracking + ball detection
             bot_tracks, ball_bbox_raw = self._track_frame(frame)
 
-            # SAM2 masks for this frame
-            if frame_idx < len(sam_results_all):
-                sam_masks, sam_bboxes = self._extract_sam_masks(
-                    sam_results_all[frame_idx], frame.shape
-                )
+            # SAM2 streaming masks: frame 0 is the seed frame (no output),
+            # tracking starts from frame 1 onward.
+            if sam_tracker._prompted and frame_idx > 0:
+                sam_detections = sam_tracker.track(frame)
             else:
-                sam_masks, sam_bboxes = [], []
+                sam_detections = sv.Detections.empty()
 
-            # Merge or fallback
+            # Merge BoT-SORT IDs with SAM2 masks, or fall back to YOLO-only
             if bot_tracks:
                 seg_result = self._merge_bot_sam_results(
-                    bot_tracks, sam_masks, sam_bboxes, frame, seg_result
+                    bot_tracks, sam_detections, frame, seg_result
                 )
             else:
                 seg_result = self._fallback_detect(
