@@ -613,7 +613,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Text prompt for the playing field (default: '' = disabled).  "
             "When non-empty (e.g. 'football pitch'), SAM3 segments the field and "
-            "the result is stored in SegmentationResult.field_mask and visualised "
+            "the result is stored in TrackerState.field_mask and visualised "
             "as a lime-green boundary overlay.  "
             "Used only with --sam_backend sam3."
         ),

@@ -212,7 +212,7 @@ def associate_poses_with_tracks(
     Parameters
     ----------
     seg_result:
-        A :class:`~segmentation_tracking.segmentation_model.SegmentationResult`
+        A :class:`~segmentation_tracking.segmentation_model.TrackerState`
         for the current frame.
     pose_result:
         A single ultralytics YOLO pose result object (from

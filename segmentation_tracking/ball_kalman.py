@@ -1237,7 +1237,7 @@ class BallDCFTracker:
         * ``"none"`` — tracker has not yet been initialised.
 
         This property is used by :class:`SegmentationTracker` to populate
-        ``SegmentationResult.ball_source`` for visualisation and diagnostics.
+        ``TrackerState.ball_source`` for visualisation and diagnostics.
         """
         return self._last_source
 

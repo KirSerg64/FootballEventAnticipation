@@ -95,7 +95,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from segmentation_tracking.segmentation_model import SegmentationResult
+from segmentation_tracking.segmentation_model import TrackerState
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ class Sam3SegmentationTracker:
 
     The tracker runs **separate SAM3 inference sessions** for each semantic
     category (players, ball, field), then merges results into the canonical
-    :class:`~segmentation_tracking.segmentation_model.SegmentationResult`
+    :class:`~segmentation_tracking.segmentation_model.TrackerState`
     data structure.
 
     Memory-efficient design
@@ -190,7 +190,7 @@ class Sam3SegmentationTracker:
     field_text_prompt:
         Text description of the playing field.  Pass *None* (default) to
         disable field segmentation.  When set (e.g. ``"football pitch"``),
-        :attr:`~segmentation_tracking.segmentation_model.SegmentationResult.field_mask`
+        :attr:`~segmentation_tracking.segmentation_model.TrackerState.field_mask`
         is populated for every frame.
     score_threshold:
         Minimum SAM3 object confidence score to accept a detection.
@@ -623,7 +623,7 @@ class Sam3SegmentationTracker:
         return result_map
 
     # ------------------------------------------------------------------
-    # Build SegmentationResult list
+    # Build TrackerState list
     # ------------------------------------------------------------------
 
     def _collect_results(
@@ -633,8 +633,8 @@ class Sam3SegmentationTracker:
         player_map: dict[int, list[tuple[int, np.ndarray]]],
         ball_map: dict[int, list[tuple[int, np.ndarray]]],
         field_map: dict[int, list[tuple[int, np.ndarray]]],
-    ) -> list[SegmentationResult]:
-        """Assemble per-frame :class:`SegmentationResult` objects.
+    ) -> list[TrackerState]:
+        """Assemble per-frame :class:`TrackerState` objects.
 
         Parameters
         ----------
@@ -664,9 +664,9 @@ class Sam3SegmentationTracker:
             for fidx, mask in frame_mask_list:
                 per_frame_field.setdefault(fidx, []).append((obj_id, mask))
 
-        results: list[SegmentationResult] = []
+        results: list[TrackerState] = []
         for frame_idx in range(num_frames):
-            seg = SegmentationResult(frame_index=frame_idx)
+            seg = TrackerState(frame_index=frame_idx)
 
             # ----- Players -----
             for obj_id, mask in per_frame_players.get(frame_idx, []):
@@ -774,7 +774,7 @@ class Sam3SegmentationTracker:
         self,
         video_path: str,
         max_frames: int | None = None,
-    ) -> list[SegmentationResult]:
+    ) -> list[TrackerState]:
         """Process a video using SAM3 text-prompt segmentation.
 
         Frame-by-frame memory model
@@ -789,7 +789,7 @@ class Sam3SegmentationTracker:
         completes (or if an error occurs).
 
         Runs up to three SAM3 inference passes (players, ball, field) then
-        merges the results into a :class:`SegmentationResult` per frame.
+        merges the results into a :class:`TrackerState` per frame.
 
         Parameters
         ----------
@@ -800,7 +800,7 @@ class Sam3SegmentationTracker:
 
         Returns
         -------
-        list[SegmentationResult]
+        list[TrackerState]
             One result per processed frame, in order.
         """
         logger.info("SAM3: extracting frames from '%s'…", video_path)

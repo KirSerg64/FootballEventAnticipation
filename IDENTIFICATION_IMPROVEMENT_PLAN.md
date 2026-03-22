@@ -374,7 +374,7 @@ The following parameters were added to
 
 - The overall pipeline structure (segmentation → pose → association → visualization)
   remains the same.
-- The `PlayerTrack`, `BallTrack`, and `SegmentationResult` data structures are
+- The `PlayerTrack`, `BallTrack`, and `TrackerState` data structures are
   backwards-compatible.
 - The JSON export format is unchanged.
 - The `visualization.py` module requires no changes (it is independent of the
