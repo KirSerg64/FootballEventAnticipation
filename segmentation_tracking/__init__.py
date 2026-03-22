@@ -14,8 +14,9 @@ Modules:
     vector_field        -- Player velocity tracking and vector-field attractor estimation
 """
 
-from segmentation_tracking.segmentation_model import SegmentationTracker, SegmentationResult
+from segmentation_tracking.segmentation_model import SegmentationTracker, TrackerState
 from segmentation_tracking.sam3_wrapper import Sam3SegmentationTracker
+from segmentation_tracking.sam2_tracker import SAM2Tracker
 from segmentation_tracking.association import PlayerTrack, BallTrack, associate_poses_with_tracks
 from segmentation_tracking.visualization import Visualizer
 from segmentation_tracking.ball_kalman import BallKalmanFilter, AdaptiveBallKalmanFilter, BallDCFTracker, BallMotionState, BallCoTrackerTracker
@@ -25,7 +26,8 @@ from segmentation_tracking.vector_field import PlayerVelocityTracker, KeypointVe
 __all__ = [
     "SegmentationTracker",
     "Sam3SegmentationTracker",
-    "SegmentationResult",
+    "SAM2Tracker",
+    "TrackerState",
     "PlayerTrack",
     "BallTrack",
     "associate_poses_with_tracks",
