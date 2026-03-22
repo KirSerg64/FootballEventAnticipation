@@ -154,9 +154,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Torch device: 'cuda' or 'cpu' (default: cuda)",
     )
     parser.add_argument(
-        "--sam_model", default="sam2.1_b.pt",
-        help="SAM2 model name / path (default: sam2.1_b.pt)",
+        "--sam_config", default="configs/sam2.1/sam2.1_b.yaml",
+        help="SAM2 model config YAML path (default: configs/sam2.1/sam2.1_b.yaml)",
     )
+    parser.add_argument(
+        "--sam_checkpoint", default="weights/sam2.1/sam2.1_b.pt",
+        help="SAM2 model checkpoint path (default: weights/sam2.1/sam2.1_b.pt)",
+    )    
     parser.add_argument(
         "--det_model", default="yolo11x.pt",
         help="YOLO detection model (default: yolo11x.pt)",
@@ -775,7 +779,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     def _build_sam2_tracker() -> SegmentationTracker:
         """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
         return SegmentationTracker(
-            sam_model_path=args.sam_model,
+            sam3_model_config=args.sam_config,
+            sam3_model_checkpoint=args.sam_checkpoint,
             det_model_path=args.det_model,
             device=args.device,
             conf_threshold=args.conf,

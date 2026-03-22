@@ -162,7 +162,9 @@ class SegmentationTracker:
 
     Parameters
     ----------
-    sam_model_path:
+    sam_model_config:
+        SAM2 model config YAML path (e.g. ``"configs/sam2.1/sam2.1_b.yaml"``).
+    sam_model_checkpoint:
         SAM2 model weights path or name (e.g. ``"sam2.1_b.pt"``).
     det_model_path:
         YOLO detection model for BoT-SORT tracking and initial SAM2 prompts.
