@@ -779,8 +779,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     def _build_sam2_tracker() -> SegmentationTracker:
         """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
         return SegmentationTracker(
-            sam3_model_config=args.sam_config,
-            sam3_model_checkpoint=args.sam_checkpoint,
+            sam_config=args.sam_config,
+            sam_checkpoint=args.sam_checkpoint,
             det_model_path=args.det_model,
             device=args.device,
             conf_threshold=args.conf,
