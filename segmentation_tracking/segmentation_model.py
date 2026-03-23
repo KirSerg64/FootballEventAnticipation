@@ -151,6 +151,9 @@ class TrackerState:
     ``"predicted"`` — velocity extrapolation (no appearance evidence).
     ``"none"``      — ball not visible / tracker not yet initialised.
     """
+    field_mask: np.ndarray | None = None
+    """Binary (uint8) green-field mask for this frame, or *None* when
+    ``field_mask_filter`` is disabled."""
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +256,17 @@ class SegmentationTracker:
         ball_cotracker_checkpoint: str | None = None,
         ball_cotracker_device: str = "cuda",
         ball_cotracker_redetect_interval: int = 15,
+        # Dedicated ball detection model (optional)
+        ball_det_model_path: str | None = None,
+        ball_det_conf: float = 0.25,
+        # Player detection class IDs (default: [0] = COCO person)
+        player_class_ids: list[int] | None = None,
+        # Field mask filter
+        field_mask_filter: bool = False,
+        field_hsv_lo: tuple[int, int, int] = (36, 40, 40),
+        field_hsv_hi: tuple[int, int, int] = (85, 255, 255),
+        field_min_overlap: float = 0.3,
+        field_mask_interval: int = 15,
     ) -> None:
         self._sam_config = sam_model_config
         self._sam_checkpoint = sam_model_checkpoint
@@ -285,7 +299,18 @@ class SegmentationTracker:
                 search_radius=ball_search_radius,
                 psr_threshold=ball_psr_threshold,
             )
-        self._sam_tracker = None        
+        self._ball_det_model_path = ball_det_model_path
+        self.ball_det_conf = ball_det_conf
+        self._ball_detector = None       # lazy-loaded dedicated ball detector
+        self._player_class_ids: list[int] = list(player_class_ids) if player_class_ids else [_PERSON_CLS]
+        self.field_mask_filter = field_mask_filter
+        self._field_hsv_lo = tuple(int(v) for v in field_hsv_lo)
+        self._field_hsv_hi = tuple(int(v) for v in field_hsv_hi)
+        self.field_min_overlap = field_min_overlap
+        self.field_mask_interval = field_mask_interval
+        self._cached_field_mask: np.ndarray | None = None
+
+        self._sam_tracker = None
         # Path to customised tracker YAML written at init time
         self._tracker_config_path: str | None = None
         self._write_tracker_config()
@@ -335,6 +360,41 @@ class SegmentationTracker:
             self._sam_tracker = SAM2Tracker(self._predictor)
         return self._sam_tracker
 
+    def _get_ball_detector(self):
+        """Return the dedicated ball detector (lazy-loaded), or the main detector as fallback."""
+        if self._ball_det_model_path is None:
+            return self._get_detector()
+        if self._ball_detector is None:
+            from ultralytics import YOLO
+            logger.info("Loading dedicated ball detection model: %s", self._ball_det_model_path)
+            self._ball_detector = YOLO(self._ball_det_model_path)
+        return self._ball_detector
+
+    def _compute_field_mask(self, frame: np.ndarray) -> np.ndarray:
+        """Return a uint8 binary mask of green-grass pixels (255 = field)."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lo = np.array(self._field_hsv_lo, dtype=np.uint8)
+        hi = np.array(self._field_hsv_hi, dtype=np.uint8)
+        return cv2.inRange(hsv, lo, hi)
+
+    def _bbox_on_field(self, bbox: np.ndarray, field_mask: np.ndarray) -> bool:
+        """Return True if the foot region of *bbox* overlaps the field mask sufficiently.
+
+        The *foot region* is the bottom 30 % of the bounding box, which
+        corresponds to where a player's feet touch the pitch.
+        """
+        h, w = field_mask.shape[:2]
+        x1, y1, x2, y2 = bbox[:4].astype(int)
+        foot_y = max(y1, y2 - max(1, int((y2 - y1) * 0.30)))
+        x1c = max(0, min(x1, w))
+        x2c = max(0, min(x2, w))
+        foot_yc = max(0, min(foot_y, h))
+        y2c = max(0, min(y2, h))
+        region = field_mask[foot_yc:y2c, x1c:x2c]
+        if region.size == 0:
+            return True  # can't determine; keep
+        return float(np.count_nonzero(region)) / region.size >= self.field_min_overlap
+
     # -- BoT-SORT tracking ----------------------------------------------------
 
     def _track_frame(
@@ -356,17 +416,23 @@ class SegmentationTracker:
             or *None*.
         """
         det = self._get_detector()
-        # Use the lower of the two thresholds so that low-confidence ball
-        # detections pass through the YOLO forward pass.  BoT-SORT applies
-        # its own track_high_thresh (= conf_threshold) for player track
-        # creation/maintenance and is unaffected by the lower value.
-        _eff_conf = min(self.conf_threshold, self.ball_conf_threshold)
+        # When no dedicated ball model is configured, detect the ball in the
+        # same BoT-SORT pass (lower effective threshold so fast-moving balls
+        # are not missed).  When a dedicated model is used the main pass is
+        # player-only, and ball detection runs separately below.
+        if self._ball_det_model_path is None:
+            track_classes = [*self._player_class_ids, _BALL_CLS]
+            _eff_conf = min(self.conf_threshold, self.ball_conf_threshold)
+        else:
+            track_classes = list(self._player_class_ids)
+            _eff_conf = self.conf_threshold
+
         results = det.track(
             frame,
             persist=True,
             tracker=self._tracker_config_path,
             conf=_eff_conf,
-            classes=[_PERSON_CLS, _BALL_CLS],
+            classes=track_classes,
             verbose=False,
         )
 
@@ -381,12 +447,24 @@ class SegmentationTracker:
                     cls = int(r.boxes.cls[i].item())
                     bbox = r.boxes.xyxy[i].cpu().numpy().astype(np.float32)
                     conf = float(r.boxes.conf[i].item())
-                    if cls == _PERSON_CLS:
+                    if cls in self._player_class_ids:
                         if r.boxes.id is not None and i < len(r.boxes.id):
                             tid = int(r.boxes.id[i].item())
                             player_tracks[tid] = bbox
                     elif cls == _BALL_CLS and conf >= self.ball_conf_threshold and conf > best_ball_conf:
                         ball_bbox = bbox
+                        best_ball_conf = conf
+
+        # Dedicated ball detector (runs on the full frame, no class filter needed)
+        if self._ball_det_model_path is not None:
+            ball_results = self._get_ball_detector().predict(
+                frame, conf=self.ball_det_conf, verbose=False,
+            )
+            if ball_results and ball_results[0].boxes is not None:
+                for box in ball_results[0].boxes:
+                    conf = float(box.conf[0].item())
+                    if conf > best_ball_conf:
+                        ball_bbox = box.xyxy[0].cpu().numpy().astype(np.float32)
                         best_ball_conf = conf
 
         return player_tracks, ball_bbox
@@ -398,10 +476,13 @@ class SegmentationTracker:
     ) -> tuple[list[np.ndarray], np.ndarray | None]:
         """Run YOLO predict (no tracker) and return (player_bboxes, ball_bbox)."""
         det = self._get_detector()
+        detect_classes = list(self._player_class_ids)
+        if self._ball_det_model_path is None:
+            detect_classes.append(_BALL_CLS)
         results = det.predict(
             frame,
             conf=self.conf_threshold,
-            classes=[_PERSON_CLS, _BALL_CLS],
+            classes=detect_classes,
             verbose=False,
         )[0]
 
@@ -413,11 +494,22 @@ class SegmentationTracker:
             cls = int(box.cls[0].item())
             conf = float(box.conf[0].item())
             xyxy = box.xyxy[0].cpu().numpy().astype(np.float32)
-            if cls == _PERSON_CLS:
+            if cls in self._player_class_ids:
                 player_bboxes.append(xyxy)
             elif cls == _BALL_CLS and conf > best_ball_conf:
                 ball_bbox = xyxy
                 best_ball_conf = conf
+
+        if self._ball_det_model_path is not None:
+            ball_results = self._get_ball_detector().predict(
+                frame, conf=self.ball_det_conf, verbose=False,
+            )
+            if ball_results and ball_results[0].boxes is not None:
+                for box in ball_results[0].boxes:
+                    conf = float(box.conf[0].item())
+                    if conf > best_ball_conf:
+                        ball_bbox = box.xyxy[0].cpu().numpy().astype(np.float32)
+                        best_ball_conf = conf
 
         return player_bboxes, ball_bbox
 
@@ -466,12 +558,16 @@ class SegmentationTracker:
         if roi.size == 0:
             return None
 
-        det = self._get_detector()
+        ball_det = self._get_ball_detector()
+        # When using a dedicated single-class model, skip the class filter;
+        # when falling back to the main general detector, restrict to ball class.
+        roi_classes = None if self._ball_det_model_path else [_BALL_CLS]
+        roi_conf = self.ball_det_conf if self._ball_det_model_path else self.ball_conf_roi
         try:
-            results = det.predict(
+            results = ball_det.predict(
                 roi,
-                conf=self.ball_conf_roi,
-                classes=[_BALL_CLS],
+                conf=roi_conf,
+                classes=roi_classes,
                 verbose=False,
             )
         except Exception as exc:
@@ -700,133 +796,6 @@ class SegmentationTracker:
     # -- SAM2 helpers ---------------------------------------------------------
 
     # -- Core processing loop -------------------------------------------------
-
-    def process_video(
-        self,
-        video_path: str,
-        max_frames: int | None = None,
-    ) -> list[TrackerState]:
-        """Process a video and return per-frame segmentation results.
-
-        Steps
-        -----
-        1. Detect players in frame 0 with YOLO; seed ``SAM2Tracker`` with those
-           bounding boxes.
-        2. For every frame: run BoT-SORT to get stable player IDs, run
-           ``SAM2Tracker.track`` to get pixel-accurate masks, then
-           Hungarian-match the two sets of results so the final output has
-           BoT-SORT ID stability with SAM2 mask quality.
-        3. Ball is tracked with detection-first correlation (instant kick
-           response) with ROI fallback and MOSSE gap-fill; appended to
-           ``TrackerState.tracks`` with ``tracker_id == -1``.
-
-        Parameters
-        ----------
-        video_path:
-            Path to the input video file.
-        max_frames:
-            If set, process at most this many frames.
-
-        Returns
-        -------
-        list[TrackerState]
-            One :class:`TrackerState` per processed frame, in order.
-        """
-        self._next_player_id = 1
-        self._ball_tracker.reset()
-
-        # -- Read first frame -------------------------------------------------
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video: {video_path}")
-        ok, first_frame = cap.read()
-        if not ok:
-            raise ValueError("Video is empty")
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if max_frames:
-            total_frames = min(total_frames, max_frames)
-        cap.release()
-
-        logger.info("Video: %s (%d frames to process)", video_path, total_frames)
-
-        # -- Detect initial players on frame 0 (seed for SAM2) ----------------
-        init_player_bboxes, _ = self._detect_frame(first_frame)
-        if not init_player_bboxes:
-            logger.warning(
-                "No players detected in the first frame; SAM2 will have no seeds."
-            )
-        logger.info(
-            "Seeding SAM2Tracker with %d player bboxes from frame 0",
-            len(init_player_bboxes),
-        )
-
-        sam_tracker = self._get_sam_predictor()
-        if init_player_bboxes:
-            init_detections = sv.Detections(
-                xyxy=np.array(init_player_bboxes, dtype=np.float32)
-            )
-            sam_tracker.prompt_first_frame(first_frame, init_detections)
-
-        # -- Single streaming pass: BoT-SORT + SAM2 per frame -----------------
-        logger.info(
-            "=== Streaming BoT-SORT (%s) + SAM2 pass ===", self.tracker
-        )
-        results: list[TrackerState] = []
-        prev_frame: np.ndarray | None = None
-
-        cap2 = cv2.VideoCapture(video_path)
-        for frame_idx in range(total_frames):
-            ok2, frame = cap2.read()
-            if not ok2:
-                break
-
-            seg_result = TrackerState(frame_index=frame_idx)
-
-            # Camera-motion compensation homography
-            homography: np.ndarray | None = None
-            if self.use_homography and prev_frame is not None:
-                homography = self._estimate_homography(prev_frame, frame)
-
-            # BoT-SORT tracking + ball detection
-            bot_tracks, ball_bbox_raw = self._track_frame(frame)
-
-            # SAM2 streaming masks: frame 0 is the seed frame (no output),
-            # tracking starts from frame 1 onward.
-            if sam_tracker._prompted and frame_idx > 0:
-                sam_detections = sam_tracker.track(frame)
-            else:
-                sam_detections = sv.Detections.empty()
-
-            # Merge BoT-SORT IDs with SAM2 masks, or fall back to YOLO-only
-            if bot_tracks:
-                seg_result = self._merge_bot_sam_results(
-                    bot_tracks, sam_detections, frame, seg_result
-                )
-            else:
-                seg_result = self._fallback_detect(
-                    frame, frame_idx, results, seg_result, homography
-                )
-
-            # Re-detection for late-entering players
-            if (
-                self.redetect_interval > 0
-                and frame_idx > 0
-                and frame_idx % self.redetect_interval == 0
-            ):
-                seg_result = self._redetect_new_players(frame, seg_result, homography)
-
-            # Ball correlation tracker (detection-first + MOSSE gap fill)
-            seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
-
-            results.append(seg_result)
-            prev_frame = frame
-
-            if (frame_idx + 1) % 50 == 0:
-                logger.info("Processed %d / %d frames", frame_idx + 1, total_frames)
-
-        cap2.release()
-        logger.info("Finished processing %d frames", len(results))
-        return results
 
     def _merge_bot_sam_results(
         self,
@@ -1102,6 +1071,7 @@ class SegmentationTracker:
         """
         self._next_player_id = 1
         self._ball_tracker.reset()
+        self._cached_field_mask = None
 
         # -- Read first frame -------------------------------------------------
         cap = cv2.VideoCapture(video_path)
@@ -1150,6 +1120,15 @@ class SegmentationTracker:
 
             seg_result = TrackerState(frame_index=frame_idx)
 
+            # Field mask (green-grass filter) — recomputed every field_mask_interval frames
+            if self.field_mask_filter:
+                if (
+                    self._cached_field_mask is None
+                    or (self.field_mask_interval > 0 and frame_idx % self.field_mask_interval == 0)
+                ):
+                    self._cached_field_mask = self._compute_field_mask(frame)
+                seg_result.field_mask = self._cached_field_mask
+
             # Camera-motion compensation homography
             homography: np.ndarray | None = None
             if self.use_homography and prev_frame is not None:
@@ -1157,6 +1136,14 @@ class SegmentationTracker:
 
             # BoT-SORT tracking + ball detection
             bot_tracks, ball_bbox_raw = self._track_frame(frame)
+
+            # Field-mask filter: discard player tracks not standing on the pitch
+            if self.field_mask_filter and self._cached_field_mask is not None and bot_tracks:
+                bot_tracks = {
+                    tid: bbox
+                    for tid, bbox in bot_tracks.items()
+                    if self._bbox_on_field(bbox, self._cached_field_mask)
+                }
 
             # SAM2 streaming masks: frame 0 is the seed frame (no output),
             # tracking starts from frame 1 onward.
