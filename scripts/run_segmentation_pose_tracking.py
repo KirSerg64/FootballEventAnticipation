@@ -779,8 +779,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     def _build_sam2_tracker() -> SegmentationTracker:
         """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
         return SegmentationTracker(
-            sam_config=args.sam_config,
-            sam_checkpoint=args.sam_checkpoint,
+            sam_model_config=args.sam_config,
+            sam_model_checkpoint=args.sam_checkpoint,
             det_model_path=args.det_model,
             device=args.device,
             conf_threshold=args.conf,
@@ -819,7 +819,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
         try:
             tracker: SegmentationTracker | Sam3SegmentationTracker = Sam3SegmentationTracker(
-                sam3_model_path=args.sam3_model,
+                sam_model_config=args.sam_config,
+                sam_model_checkpoint=args.sam_checkpoint,
                 device=args.device,
                 player_text_prompt=args.sam3_player_prompt,
                 ball_text_prompt=args.sam3_ball_prompt or None,
