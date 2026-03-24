@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import numpy as np
 import supervision as sv
 import torch
@@ -10,6 +11,23 @@ class SAM2Tracker:
         self._prompted = False
         self._track_id = []
         self._frame_idx = 0
+        # Cache which CUDA device SAM2 lives on so that we can temporarily
+        # make it the active device before each call.  This prevents tensor-
+        # device mismatches when YOLO (cuda:0) has already called
+        # torch.cuda.set_device(0) and SAM2 is on a different GPU (cuda:1).
+        try:
+            _p = next(predictor.parameters())
+            self._cuda_device: torch.device | None = (
+                _p.device if _p.device.type == "cuda" else None
+            )
+        except StopIteration:
+            self._cuda_device = None
+
+    def _device_context(self):
+        """Context manager that sets the active CUDA device to SAM2's GPU."""
+        if self._cuda_device is not None:
+            return torch.cuda.device(self._cuda_device)
+        return contextlib.nullcontext()
 
     def prompt_first_frame(self, frame: np.ndarray, detections: sv.Detections) -> None:
         if len(detections.xyxy) == 0:
@@ -18,7 +36,7 @@ class SAM2Tracker:
         if not self._track_id:
             self._track_id = list(range(1, len(detections.xyxy) + 1))
 
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16), self._device_context():
             self._predictor.load_first_frame(frame)
             for bbox, obj_id in zip(detections.xyxy, self._track_id):
                 _, out_obj_ids, out_mask_logits = self._predictor.add_new_prompt(
@@ -49,7 +67,7 @@ class SAM2Tracker:
         if not self._prompted:
             raise RuntimeError("Call prompt_first_frame before propagate")
 
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16), self._device_context():
             if new_detections is not None and len(new_detections) > 0:
                 start_id = max(self._track_id, default=0) + 1
                 new_ids = list(range(start_id, start_id + len(new_detections)))
