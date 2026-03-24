@@ -51,6 +51,8 @@ from typing import Any
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from segmentation_tracking.segmentation_model import TrackerState
+
 logger = logging.getLogger(__name__)
 
 # COCO 17-keypoint names (for documentation / downstream use)
@@ -195,7 +197,7 @@ def _center_distance(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 def associate_poses_with_tracks(
-    seg_result: Any,
+    seg_result: TrackerState,
     pose_result: Any,
     frame_shape: tuple[int, int],
     iou_threshold: float = 0.1,
@@ -242,8 +244,8 @@ def associate_poses_with_tracks(
     if seg_result.ball_center is not None:
         ball_track = BallTrack(
             center=seg_result.ball_center,
-            bbox=seg_result.ball_bbox,
-            mask=seg_result.ball_mask,
+            bbox=seg_result.xyxy[-1],
+            mask=seg_result.mask[-1],
             source=getattr(seg_result, "ball_source", "none"),
         )
 
@@ -291,7 +293,7 @@ def associate_poses_with_tracks(
                 pose_scores.append(kp_conf)
 
     # -- Hungarian IoU matching -----------------------------------------------
-    n_tracks = len(seg_result.player_ids)
+    n_tracks = len(seg_result.tracks.tracker_id)
     n_poses = len(pose_bboxes)
 
     # kp_map[track_idx] = pose_idx  (populated by matching passes)
@@ -301,7 +303,7 @@ def associate_poses_with_tracks(
     if n_tracks > 0 and n_poses > 0:
         # Build IoU cost matrix
         cost = np.ones((n_tracks, n_poses), dtype=np.float64)
-        for ti, seg_bbox in enumerate(seg_result.player_bboxes):
+        for ti, seg_bbox in enumerate(seg_result.tracks.xyxy):
             for pi, pose_bbox in enumerate(pose_bboxes):
                 cost[ti, pi] = 1.0 - _bbox_iou(seg_bbox, pose_bbox)
 
@@ -324,7 +326,7 @@ def associate_poses_with_tracks(
                 for i, ti in enumerate(unmatched_tracks):
                     for j, pi in enumerate(unused_poses):
                         d = _center_distance(
-                            seg_result.player_bboxes[ti], pose_bboxes[pi]
+                            seg_result.tracks.xyxy[ti], pose_bboxes[pi]
                         )
                         if d < max_center_dist:
                             dist_cost[i, j] = d
@@ -339,7 +341,7 @@ def associate_poses_with_tracks(
 
     # -- Build PlayerTrack objects --------------------------------------------
     for ti, (pid, mask, seg_bbox) in enumerate(
-        zip(seg_result.player_ids, seg_result.player_masks, seg_result.player_bboxes)
+        zip(seg_result.tracks.tracker_id, seg_result.tracks.mask, seg_result.tracks.xyxy)
     ):
         pi = kp_map.get(ti)
         player_tracks.append(

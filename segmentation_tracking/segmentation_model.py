@@ -267,11 +267,18 @@ class SegmentationTracker:
         field_hsv_hi: tuple[int, int, int] = (85, 255, 255),
         field_min_overlap: float = 0.3,
         field_mask_interval: int = 15,
+        # Per-model device overrides for multi-GPU deployment (default: same as `device`)
+        det_device: str | None = None,
+        sam_device: str | None = None,
+        ball_det_device: str | None = None,
     ) -> None:
         self._sam_config = sam_model_config
         self._sam_checkpoint = sam_model_checkpoint
         self.det_model_path = det_model_path
         self.device = device
+        self._det_device      = det_device      or device
+        self._sam_device      = sam_device      or device
+        self._ball_det_device = ball_det_device or device
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.redetect_interval = redetect_interval
@@ -356,7 +363,10 @@ class SegmentationTracker:
             from sam2.build_sam import build_sam2_camera_predictor
 
             logger.info("Loading SAM2 model: %s", self._sam_checkpoint)
-            self._predictor = build_sam2_camera_predictor(self._sam_config, self._sam_checkpoint)
+            self._predictor = build_sam2_camera_predictor(
+                self._sam_config, self._sam_checkpoint,
+                device=self._sam_device,
+            )
             self._sam_tracker = SAM2Tracker(self._predictor)
         return self._sam_tracker
 
@@ -434,6 +444,7 @@ class SegmentationTracker:
             conf=_eff_conf,
             classes=track_classes,
             verbose=False,
+            device=self._det_device,
         )
 
         player_tracks: dict[int, np.ndarray] = {}
@@ -459,6 +470,7 @@ class SegmentationTracker:
         if self._ball_det_model_path is not None:
             ball_results = self._get_ball_detector().predict(
                 frame, conf=self.ball_det_conf, verbose=False,
+                device=self._ball_det_device,
             )
             if ball_results and ball_results[0].boxes is not None:
                 for box in ball_results[0].boxes:
@@ -484,6 +496,7 @@ class SegmentationTracker:
             conf=self.conf_threshold,
             classes=detect_classes,
             verbose=False,
+            device=self._det_device,
         )[0]
 
         player_bboxes: list[np.ndarray] = []
@@ -503,6 +516,7 @@ class SegmentationTracker:
         if self._ball_det_model_path is not None:
             ball_results = self._get_ball_detector().predict(
                 frame, conf=self.ball_det_conf, verbose=False,
+                device=self._ball_det_device,
             )
             if ball_results and ball_results[0].boxes is not None:
                 for box in ball_results[0].boxes:
@@ -569,6 +583,7 @@ class SegmentationTracker:
                 conf=roi_conf,
                 classes=roi_classes,
                 verbose=False,
+                device=self._ball_det_device,
             )
         except Exception as exc:
             logger.debug("ROI ball detection failed: %s", exc)

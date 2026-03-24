@@ -648,6 +648,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "and crash the process — useful when debugging SAM3 itself."
         ),
     )
+    # Per-model device overrides for multi-GPU deployment
+    parser.add_argument(
+        "--det_device", default=None,
+        help=(
+            "Device for the YOLO player/ball tracker (default: same as --device). "
+            "E.g. 'cuda:0'.  Useful when spreading models across multiple GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--sam_device", default=None,
+        help=(
+            "Device for the SAM2 segmentation predictor and pose estimator "
+            "(default: same as --device).  E.g. 'cuda:1'."
+        ),
+    )
+    parser.add_argument(
+        "--ball_det_device", default=None,
+        help=(
+            "Device for the dedicated ball detector --ball_det_model "
+            "(default: same as --det_device, then --device).  E.g. 'cuda:0'."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -676,8 +698,9 @@ def _build_pose_estimator(args: argparse.Namespace):
     import torch
     from pose_estimation.pose_model import create_pose_estimator
 
+    _pose_dev = getattr(args, "sam_device", None) or args.device
     device = torch.device(
-        "cuda" if args.device.startswith("cuda") and torch.cuda.is_available()
+        _pose_dev if _pose_dev.startswith("cuda") and torch.cuda.is_available()
         else "cpu"
     )
 
@@ -776,6 +799,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
         args.sam_backend.upper(),
     )
 
+    # Auto multi-GPU assignment: spread models across GPUs when >=2 are available
+    # and the user has not explicitly set any per-model device override.
+    import torch as _torch
+    _n_gpus = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
+    if _n_gpus >= 2 and args.det_device is None and args.sam_device is None:
+        args.det_device      = "cuda:0"
+        args.ball_det_device = args.ball_det_device or "cuda:0"
+        args.sam_device      = "cuda:1"
+        logger.info(
+            "Multi-GPU auto-assignment: YOLO\u2192%s  SAM2+pose\u2192%s  (%d GPUs detected)",
+            args.det_device, args.sam_device, _n_gpus,
+        )
+
     def _build_sam2_tracker() -> SegmentationTracker:
         """Return a fully-configured SAM2 + YOLO BoT-SORT tracker."""
         return SegmentationTracker(
@@ -807,6 +843,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             field_hsv_hi=tuple(int(x) for x in args.field_hsv_hi.split(",")),  # type: ignore[arg-type]
             field_min_overlap=args.field_min_overlap,
             field_mask_interval=args.field_mask_interval,
+            det_device=args.det_device,
+            sam_device=args.sam_device,
+            ball_det_device=args.ball_det_device or args.det_device,
         )
 
     if args.sam_backend == "sam3":
