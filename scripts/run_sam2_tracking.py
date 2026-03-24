@@ -142,7 +142,7 @@ def run(args: argparse.Namespace) -> None:
     predictor = build_sam2_camera_predictor(
         args.sam_config,
         args.sam_checkpoint,
-        device=device,
+        device="cuda:1",
     )
 
     # Import SAM2Tracker (lives in the segmentation_tracking package)
