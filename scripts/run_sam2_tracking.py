@@ -128,21 +128,38 @@ def run(args: argparse.Namespace) -> None:
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
-    device = args.device
+    # -- Device assignment ---------------------------------------------------
+    # Auto multi-GPU: YOLO → cuda:0, SAM2 → cuda:1 when ≥2 GPUs available
+    # and the user has not set explicit overrides.
+    _n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    det_device = args.det_device or args.device
+    sam_device = args.sam_device or args.device
+    if _n_gpus >= 2 and args.det_device is None and args.sam_device is None:
+        det_device = "cuda:0"
+        sam_device = "cuda:1"
+        logger.info(
+            "Multi-GPU auto-assignment: YOLO→%s  SAM2→%s  (%d GPUs detected)",
+            det_device, sam_device, _n_gpus,
+        )
 
-    # -- Step 1: First pass with YOLO BoT-SORT to get initial bounding boxes
-    #    then prompt SAM2 on the first frame ---------------------------------
-    logger.info("Loading YOLO model: %s", args.det_model)
+    # -- Load YOLO -----------------------------------------------------------
+    logger.info("Loading YOLO model: %s  (device=%s)", args.det_model, det_device)
     from ultralytics import YOLO
     yolo = YOLO(args.det_model)
 
-    # -- Step 2: Build SAM2 camera predictor ---------------------------------
-    logger.info("Loading SAM2: config=%s  checkpoint=%s", args.sam_config, args.sam_checkpoint)
+    # Flush any activation memory YOLO allocated during import before loading
+    # the much larger SAM2 model weights.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # -- Build SAM2 camera predictor -----------------------------------------
+    logger.info("Loading SAM2: config=%s  checkpoint=%s  (device=%s)",
+                args.sam_config, args.sam_checkpoint, sam_device)
     from sam2.build_sam import build_sam2_camera_predictor
     predictor = build_sam2_camera_predictor(
         args.sam_config,
         args.sam_checkpoint,
-        device="cuda:1",
+        device=sam_device,
     )
 
     # Import SAM2Tracker (lives in the segmentation_tracking package)
@@ -182,7 +199,7 @@ def run(args: argparse.Namespace) -> None:
             conf=args.conf,
             classes=[_PERSON_CLS],
             verbose=False,
-            device=device,
+            device=det_device,
         )
 
         # Build supervision Detections from YOLO output
@@ -317,7 +334,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device", default="cuda",
-        help="Torch device: 'cuda', 'cuda:0', 'cuda:1', or 'cpu'",
+        help="Torch device fallback for both models: 'cuda', 'cuda:0', 'cuda:1', or 'cpu'",
+    )
+    parser.add_argument(
+        "--det_device", default=None,
+        help="Device for YOLO BoT-SORT tracker (overrides --device).  E.g. 'cuda:0'.",
+    )
+    parser.add_argument(
+        "--sam_device", default=None,
+        help="Device for SAM2 predictor (overrides --device).  E.g. 'cuda:1'.",
     )
     parser.add_argument(
         "--conf", type=float, default=0.25,
