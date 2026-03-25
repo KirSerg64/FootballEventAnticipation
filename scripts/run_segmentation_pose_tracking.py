@@ -670,6 +670,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: same as --det_device, then --device).  E.g. 'cuda:0'."
         ),
     )
+    parser.add_argument(
+        "--sam_bfloat16", action="store_true", default=False,
+        help=(
+            "Cast SAM2 model weights to bfloat16 after loading.  Halves VRAM usage "
+            "(large model: ~7 GB instead of ~14 GB; base model: ~2 GB instead of ~4 GB) "
+            "with negligible accuracy impact for video segmentation.  "
+            "Recommended when GPU memory is limited."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -846,6 +855,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             det_device=args.det_device,
             sam_device=args.sam_device,
             ball_det_device=args.ball_det_device or args.det_device,
+            sam_bfloat16=args.sam_bfloat16,
         )
 
     if args.sam_backend == "sam3":

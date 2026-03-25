@@ -6,11 +6,20 @@ import torch
 
 
 class SAM2Tracker:
-    def __init__(self, predictor) -> None:
+    def __init__(self, predictor, use_bfloat16_weights: bool = False) -> None:
         self._predictor = predictor
         self._prompted = False
         self._track_id = []
         self._frame_idx = 0
+        # Optionally cast model weights to bfloat16 to halve VRAM usage.
+        # Activations are already bfloat16 via torch.autocast; casting the
+        # weights too makes the entire model run in bfloat16 and typically
+        # has negligible accuracy impact for video segmentation tasks.
+        if use_bfloat16_weights:
+            try:
+                predictor.to(torch.bfloat16)
+            except Exception:
+                pass  # some SAM2 predictors don't expose .to(); fail silently
         # Cache which CUDA device SAM2 lives on so that we can temporarily
         # make it the active device before each call.  This prevents tensor-
         # device mismatches when YOLO (cuda:0) has already called

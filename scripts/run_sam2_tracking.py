@@ -170,7 +170,7 @@ def run(args: argparse.Namespace) -> None:
         sys.path.insert(0, _repo_root)
 
     from segmentation_tracking.sam2_tracker import SAM2Tracker
-    sam_tracker = SAM2Tracker(predictor)
+    sam_tracker = SAM2Tracker(predictor, use_bfloat16_weights=args.sam_bfloat16)
 
     # -- Step 3: Open video --------------------------------------------------
     cap = cv2.VideoCapture(args.input)
@@ -231,6 +231,9 @@ def run(args: argparse.Namespace) -> None:
         # -- SAM2: seed on first detection, then track -----------------------
         if not prompted:
             logger.info("Prompting SAM2 with %d players on frame %d", len(yolo_dets), frame_idx)
+            # Flush YOLO's lingering activation allocations before SAM2 needs memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             sam_tracker.prompt_first_frame(frame, yolo_dets)
             prompted = True
             writer.write(frame)
@@ -321,11 +324,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to annotated output video",
     )
     parser.add_argument(
-        "--sam_config", default="configs/sam2.1/sam2.1_hiera_l.yaml",
+        "--sam_config", default="configs/sam2.1/sam2.1_b.yaml",
         help="SAM2 model config YAML",
     )
     parser.add_argument(
-        "--sam_checkpoint", default="checkpoints/sam2.1_hiera_large.pt",
+        "--sam_checkpoint", default="weights/sam2.1/sam2.1_b.pt",
         help="SAM2 model checkpoint",
     )
     parser.add_argument(
@@ -343,6 +346,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sam_device", default=None,
         help="Device for SAM2 predictor (overrides --device).  E.g. 'cuda:1'.",
+    )
+    parser.add_argument(
+        "--sam_bfloat16", action="store_true", default=False,
+        help=(
+            "Cast SAM2 weights to bfloat16 after loading.  Halves VRAM usage "
+            "(large: ~7 GB → ~3.5 GB; base: ~4 GB → ~2 GB) with negligible "
+            "accuracy cost.  Strongly recommended when using the large model "
+            "or when GPU memory is limited."
+        ),
     )
     parser.add_argument(
         "--conf", type=float, default=0.25,

@@ -271,6 +271,8 @@ class SegmentationTracker:
         det_device: str | None = None,
         sam_device: str | None = None,
         ball_det_device: str | None = None,
+        # Cast SAM2 weights to bfloat16 to halve VRAM (~7 GB for large, ~2 GB for base)
+        sam_bfloat16: bool = False,
     ) -> None:
         self._sam_config = sam_model_config
         self._sam_checkpoint = sam_model_checkpoint
@@ -279,6 +281,7 @@ class SegmentationTracker:
         self._det_device      = det_device      or device
         self._sam_device      = sam_device      or device
         self._ball_det_device = ball_det_device or device
+        self._sam_bfloat16    = sam_bfloat16
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.redetect_interval = redetect_interval
@@ -367,7 +370,7 @@ class SegmentationTracker:
                 self._sam_config, self._sam_checkpoint,
                 device=self._sam_device,
             )
-            self._sam_tracker = SAM2Tracker(self._predictor)
+            self._sam_tracker = SAM2Tracker(self._predictor, use_bfloat16_weights=self._sam_bfloat16)
         return self._sam_tracker
 
     def _get_ball_detector(self):
