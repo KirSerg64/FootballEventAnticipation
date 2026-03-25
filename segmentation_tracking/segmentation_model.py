@@ -1116,13 +1116,6 @@ class SegmentationTracker:
             len(init_player_bboxes),
         )
 
-        sam_tracker = self._get_sam_predictor()
-        if init_player_bboxes:
-            init_detections = sv.Detections(
-                xyxy=np.array(init_player_bboxes, dtype=np.float32)
-            )
-            sam_tracker.prompt_first_frame(first_frame, init_detections)
-
         # -- Single streaming pass: BoT-SORT + SAM2 per frame -----------------
         logger.info(
             "=== Streaming BoT-SORT (%s) + SAM2 pass ===", self.tracker
@@ -1162,27 +1155,13 @@ class SegmentationTracker:
                     for tid, bbox in bot_tracks.items()
                     if self._bbox_on_field(bbox, self._cached_field_mask)
                 }
+            # Merge BoT-SORT IDs, or fall back to YOLO-only
 
-            # SAM2 streaming masks: frame 0 is the seed frame (no output),
-            # tracking starts from frame 1 onward.
-            if sam_tracker._prompted and frame_idx > 0:
-                sam_detections = sam_tracker.track(frame)
-            else:
-                sam_detections = sv.Detections.empty()
-
-            # Merge BoT-SORT IDs with SAM2 masks, or fall back to YOLO-only
-            if bot_tracks:
-                seg_result = self._merge_bot_sam_results(
-                    bot_tracks, sam_detections, frame, seg_result
-                )
-            else:
-                seg_result = self._fallback_detect(
-                    frame, frame_idx, results, seg_result, homography
-                )
-
+            seg_result = self._fallback_detect(
+                frame, frame_idx, results, seg_result, homography
+            )
             # Re-detection for late-entering players
-            if (
-                self.redetect_interval > 0
+            if (self.redetect_interval > 0
                 and frame_idx > 0
                 and frame_idx % self.redetect_interval == 0
             ):

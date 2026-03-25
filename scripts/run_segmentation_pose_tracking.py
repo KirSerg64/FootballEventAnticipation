@@ -894,9 +894,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             tracker = _build_sam2_tracker()
             seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
     else:
-        # Default SAM2 + YOLO BoT-SORT tracker
-        tracker = _build_sam2_tracker()
-        seg_results = tracker.process_video(args.input, max_frames=args.max_frames)
+        # Default YOLO BoT-SORT tracker
+        track_results = tracker.process_video(args.input, max_frames=args.max_frames)
     logger.info("Segmentation complete: %d frames", len(seg_results))
 
     # -- Step 2: Pose estimation -----------------------------------------------
