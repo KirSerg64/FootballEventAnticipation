@@ -154,6 +154,12 @@ class TrackerState:
     field_mask: np.ndarray | None = None
     """Binary (uint8) green-field mask for this frame, or *None* when
     ``field_mask_filter`` is disabled."""
+    homography: np.ndarray | None = None
+    """Frame-to-frame ORB+RANSAC homography matrix ``(3, 3) float64``
+    mapping the *previous* frame's pixel coordinates to the *current*
+    frame's pixel coordinates (camera-motion compensation).
+    *None* when homography estimation is disabled
+    (``use_homography=False``) or on the first frame."""
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1150,7 @@ class SegmentationTracker:
             homography: np.ndarray | None = None
             if self.use_homography and prev_frame is not None:
                 homography = self._estimate_homography(prev_frame, frame)
+            seg_result.homography = homography
 
             # BoT-SORT tracking + ball detection
             bot_tracks, ball_bbox_raw = self._track_frame(frame)

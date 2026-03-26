@@ -121,6 +121,181 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# CameraMotionCompensator
+# ---------------------------------------------------------------------------
+
+class CameraMotionCompensator:
+    """Remove camera-pan artefacts from player velocity / acceleration vectors
+    before they are fed into :func:`estimate_attractor`.
+
+    When the camera pans, every player's *screen-space* velocity is shifted by
+    the same camera-motion vector.  :func:`estimate_attractor` then finds a
+    convergence point that is biased toward the camera's scroll direction
+    instead of the true ball position.
+
+    Three compensation modes are supported:
+
+    ``"none"``
+        No compensation.  Velocities are passed through unmodified.
+
+    ``"median"``
+        Subtract the **median** velocity (or acceleration) across all tracked
+        players from every player's vector.  The median is a robust estimator
+        of the common camera-motion component.  Works for pan, tilt, and slow
+        zoom without any extra dependencies.  Recommended for most broadcast
+        football footage.
+
+    ``"homography"``
+        Use the per-frame ORB+RANSAC homography stored in
+        ``TrackerState.homography`` to compute the exact camera-induced
+        displacement per player and subtract it.  Handles pan + tilt + zoom +
+        in-plane rotation.  Falls back to ``"median"`` when no homography is
+        available (first frame or ``use_homography=False``).
+
+    Parameters
+    ----------
+    mode:
+        ``"none"``, ``"median"``, or ``"homography"``.  Default ``"median"``.
+    history_len:
+        Velocity-tracker position-history window length (same as
+        ``attractor_history`` in the run script).  Used by the
+        ``"homography"`` mode to accumulate per-frame H matrices over the
+        same time span as the measured velocity.  Default ``5``.
+    """
+
+    _VALID_MODES = ("none", "median", "homography")
+
+    def __init__(self, mode: str = "median", history_len: int = 5) -> None:
+        if mode not in self._VALID_MODES:
+            raise ValueError(
+                f"mode must be one of {self._VALID_MODES}; got {mode!r}"
+            )
+        if history_len < 1:
+            raise ValueError("history_len must be at least 1")
+        self._mode = mode
+        self._history_len = history_len
+        # Per-frame homography matrices ordered oldest → newest.
+        # Maximum length = history_len - 1 (the span between oldest and newest
+        # positions used by the velocity tracker).
+        self._h_fifo: deque[np.ndarray] = deque(maxlen=max(1, history_len - 1))
+
+    @property
+    def mode(self) -> str:
+        """Active compensation mode."""
+        return self._mode
+
+    def reset(self) -> None:
+        """Clear accumulated homography state (call on scene cut)."""
+        self._h_fifo.clear()
+
+    def update(self, homography: "np.ndarray | None") -> None:
+        """Advance internal camera state by one frame.
+
+        Must be called **once per video frame** regardless of whether
+        :meth:`compensate` is called, so the H deque stays in sync with the
+        velocity-tracker history.
+
+        Parameters
+        ----------
+        homography:
+            Per-frame homography from ``TrackerState.homography`` (maps
+            ``prev`` → ``curr`` pixel coordinates).  *None* is ignored.
+        """
+        if self._mode == "homography" and homography is not None:
+            self._h_fifo.append(homography.astype(np.float64))
+
+    def compensate(
+        self,
+        vectors: "dict[int, tuple[float, float, float, float]]",
+    ) -> "dict[int, tuple[float, float, float, float]]":
+        """Return a camera-compensated copy of *vectors*.
+
+        Parameters
+        ----------
+        vectors:
+            ``{player_id: (cx, cy, dx, dy)}`` as returned by
+            :meth:`PlayerVelocityTracker.update` or
+            :meth:`PlayerVelocityTracker.get_accelerations`.  Passed through
+            unchanged when *mode* is ``"none"`` or *vectors* is empty.
+
+        Returns
+        -------
+        dict[int, tuple[float, float, float, float]]
+            Compensated copy; ``(cx, cy)`` fields are unchanged, only
+            ``(dx, dy)`` are adjusted.
+        """
+        if self._mode == "none" or not vectors:
+            return vectors
+        if self._mode == "median":
+            return self._compensate_median(vectors)
+        return self._compensate_homography(vectors)
+
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    def _compensate_median(
+        self,
+        vectors: "dict[int, tuple[float, float, float, float]]",
+    ) -> "dict[int, tuple[float, float, float, float]]":
+        """Subtract the median (dx, dy) across all players."""
+        if len(vectors) < 2:
+            return vectors
+        dxs = [v[2] for v in vectors.values()]
+        dys = [v[3] for v in vectors.values()]
+        med_dx = float(np.median(dxs))
+        med_dy = float(np.median(dys))
+        return {
+            pid: (cx, cy, dx - med_dx, dy - med_dy)
+            for pid, (cx, cy, dx, dy) in vectors.items()
+        }
+
+    def _compensate_homography(
+        self,
+        vectors: "dict[int, tuple[float, float, float, float]]",
+    ) -> "dict[int, tuple[float, float, float, float]]":
+        """Subtract the homography-derived camera motion per player.
+
+        Accumulates per-frame Hs into ``H_acc`` mapping ``t-span → t``.
+        For each player the camera-induced displacement is estimated by
+        warping the approximate oldest position through ``H_acc``.
+
+        Falls back to :meth:`_compensate_median` when no Hs are available.
+        """
+        if not self._h_fifo:
+            logger.debug(
+                "CameraMotionCompensator: no H available, falling back to median"
+            )
+            return self._compensate_median(vectors)
+
+        # Accumulate H_acc = H_{newest} ∘ ... ∘ H_{oldest}
+        # Iterating oldest→newest: H_acc = h_new @ h_old @ ... @ I
+        H_acc = np.eye(3, dtype=np.float64)
+        for h in self._h_fifo:          # deque is oldest → newest
+            H_acc = h @ H_acc
+
+        span = float(len(self._h_fifo))
+
+        result: "dict[int, tuple[float, float, float, float]]" = {}
+        for pid, (cx, cy, dx, dy) in vectors.items():
+            # Approximate position `span` frames ago
+            old_x = cx - dx * span
+            old_y = cy - dy * span
+
+            # Where that point would appear now from camera motion alone
+            old_hom = np.array([old_x, old_y, 1.0], dtype=np.float64)
+            new_hom = H_acc @ old_hom
+            new_hom /= new_hom[2]  # homogeneous normalise
+
+            # Camera-implied displacement per frame
+            cam_dx = (new_hom[0] - old_x) / span
+            cam_dy = (new_hom[1] - old_y) / span
+
+            result[pid] = (cx, cy, dx - cam_dx, dy - cam_dy)
+
+        return result
+
+
 # ---------------------------------------------------------------------------
 # COCO keypoint indices used for direction estimation
 # ---------------------------------------------------------------------------

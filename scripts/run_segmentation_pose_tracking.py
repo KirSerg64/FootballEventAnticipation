@@ -125,6 +125,7 @@ from segmentation_tracking import (
     KeypointVelocityTracker,
     estimate_attractor,
     AttractorSmoother,
+    CameraMotionCompensator,
 )
 
 logging.basicConfig(
@@ -413,6 +414,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no_homography", action="store_true",
         help="Disable camera-motion compensation (ORB + RANSAC homography)",
+    )
+    parser.add_argument(
+        "--cam_comp", default="median",
+        choices=["none", "median", "homography"],
+        help=(
+            "Camera-motion compensation mode for the vector-field attractor "
+            "(default: median).  Without compensation the attractor drifts in "
+            "the camera's scroll direction when the ball is lost.  "
+            "'none' disables compensation (legacy behaviour).  "
+            "'median' subtracts the median player velocity/acceleration across "
+            "all tracked players — robust approximation requiring no extra data.  "
+            "'homography' uses the per-frame ORB+RANSAC homography matrix already "
+            "computed by the tracker (requires --no_homography to be unset) to "
+            "geometrically cancel the camera-induced displacement per player; "
+            "handles zoom and rotation in addition to pan.  Falls back to "
+            "'median' when homography is unavailable (first frame or "
+            "--no_homography)."
+        ),
     )
     # Improvement F: team colour clustering
     parser.add_argument(
@@ -985,6 +1004,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
     # Remember the last smoothed attractor point for distance-weighting anchor
     _prev_attractor_pt: tuple[float, float] | None = None
 
+    # Camera-motion compensator for the velocity / attractor pipeline
+    cam_comp: CameraMotionCompensator | None = (
+        CameraMotionCompensator(
+            mode=args.cam_comp,
+            history_len=args.attractor_history,
+        )
+        if args.show_attractor and args.cam_comp != "none"
+        else None
+    )
+
     # JSON export accumulators
     player_tracks_export: list[dict] = []
     ball_track_export: list[dict] = []
@@ -1057,8 +1086,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
             else:  # combined: keypoints take priority, bbox fills gaps
                 merged_vels = {**bbox_vels, **kp_vels}
 
-            # Expose velocities for arrow visualisation (use whichever is active)
-            velocities = merged_vels if merged_vels else None
+            # Advance camera-motion compensator state for this frame
+            # (must happen every frame, regardless of attractor_source)
+            if cam_comp is not None:
+                cam_comp.update(getattr(seg_result, "homography", None))
+
+            # Camera-compensate velocity vectors (for arrow visualisation)
+            comp_vels = (
+                cam_comp.compensate(merged_vels)
+                if cam_comp is not None and merged_vels
+                else merged_vels
+            )
+
+            # Expose velocities for arrow visualisation (use compensated version)
+            velocities = comp_vels if comp_vels else None
 
             # Choose direction vectors based on attractor mode
             if args.attractor_mode == "acceleration":
@@ -1077,8 +1118,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     direction_vectors = kp_acc
                 else:
                     direction_vectors = {**bbox_acc, **kp_acc}
+
+                # Compensate acceleration vectors separately
+                if cam_comp is not None and direction_vectors:
+                    direction_vectors = cam_comp.compensate(direction_vectors)
             else:
-                direction_vectors = merged_vels
+                # Velocity mode: reuse the already-compensated velocity dict
+                direction_vectors = comp_vels or merged_vels
 
             # Determine anchor point for distance / directional weighting.
             # Prefer the ball when detected; fall back to the previous smoothed
