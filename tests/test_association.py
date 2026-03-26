@@ -331,28 +331,31 @@ class TestCocoConstants:
 # TestKnownBugs  — document AttributeErrors in the current implementation
 # ---------------------------------------------------------------------------
 
-class TestKnownBugs:
-    """Document existing bugs so they are visible when/if they get fixed."""
+class TestBugFixes:
+    """Verify previously known bugs are resolved."""
 
-    def test_ball_center_on_real_tracker_state_raises_attribute_error(self):
+    def test_ball_only_entry_does_not_appear_in_player_tracks(self):
         """
-        Bug: association.py accesses ``seg_result.xyxy[-1]`` instead of
-        ``seg_result.tracks.xyxy[-1]``.  TrackerState has no ``.xyxy``
-        attribute, so AttributeError is raised when ball_center is set.
+        Ball entry (tracker_id == -1) must be excluded from player tracks
+        and must populate the BallTrack instead.
         """
         seg = _seg(bboxes=[[0, 0, 10, 10]], tracker_ids=[-1],
                    ball_center=(5.0, 5.0))
-        with pytest.raises(AttributeError):
-            associate_poses_with_tracks(seg, None, (64, 64))
+        pts, bt = associate_poses_with_tracks(seg, None, (64, 64))
+        assert pts == [], "ball entry must not appear as a PlayerTrack"
+        assert bt is not None
+        assert bt.center == (5.0, 5.0)
+        assert bt.bbox is not None
+        np.testing.assert_array_almost_equal(bt.bbox, [0, 0, 10, 10])
 
-    def test_none_tracks_raises_attribute_error(self):
+    def test_none_tracks_returns_empty_results(self):
         """
-        Bug: ``len(seg_result.tracks.tracker_id)`` is called unconditionally,
-        so passing a TrackerState with tracks=None raises AttributeError.
+        TrackerState with tracks=None must return empty lists, not raise.
         """
         seg = TrackerState(frame_index=0, tracks=None)
-        with pytest.raises(AttributeError):
-            associate_poses_with_tracks(seg, None, (64, 64))
+        pts, bt = associate_poses_with_tracks(seg, None, (64, 64))
+        assert pts == []
+        assert bt is None
 
 
 # ---------------------------------------------------------------------------

@@ -240,12 +240,42 @@ def associate_poses_with_tracks(
     player_tracks: list[PlayerTrack] = []
     ball_track: BallTrack | None = None
 
+    # -- Guard against empty tracking result ----------------------------------
+    if seg_result.tracks is None or seg_result.tracks.tracker_id is None:
+        return player_tracks, ball_track
+
+    tracker_ids = seg_result.tracks.tracker_id  # int32 array; -1 marks the ball
+
+    # -- Split player entries from the ball entry -----------------------------
+    # The ball (if present) is stored in `tracks` with tracker_id == -1.
+    player_mask = tracker_ids != -1
+    ball_indices = np.where(tracker_ids == -1)[0]
+
+    player_ids_arr  = tracker_ids[player_mask]
+    player_bboxes_seg = seg_result.tracks.xyxy[player_mask]
+    player_masks_seg  = (
+        seg_result.tracks.mask[player_mask]
+        if seg_result.tracks.mask is not None
+        else np.zeros((player_mask.sum(), *seg_result.tracks.xyxy.shape[:0]), dtype=bool)
+    )
+
     # -- Build ball track -----------------------------------------------------
     if seg_result.ball_center is not None:
+        if len(ball_indices) > 0:
+            bi = ball_indices[0]
+            ball_bbox = seg_result.tracks.xyxy[bi]
+            ball_mask_arr = (
+                seg_result.tracks.mask[bi]
+                if seg_result.tracks.mask is not None
+                else None
+            )
+        else:
+            ball_bbox = None
+            ball_mask_arr = None
         ball_track = BallTrack(
             center=seg_result.ball_center,
-            bbox=seg_result.xyxy[-1],
-            mask=seg_result.mask[-1],
+            bbox=ball_bbox,
+            mask=ball_mask_arr,
             source=getattr(seg_result, "ball_source", "none"),
         )
 
@@ -292,8 +322,8 @@ def associate_poses_with_tracks(
                 pose_keypoints.append(kp_xy)
                 pose_scores.append(kp_conf)
 
-    # -- Hungarian IoU matching -----------------------------------------------
-    n_tracks = len(seg_result.tracks.tracker_id)
+    # -- Hungarian IoU matching (players only, ball excluded) -----------------
+    n_tracks = len(player_ids_arr)
     n_poses = len(pose_bboxes)
 
     # kp_map[track_idx] = pose_idx  (populated by matching passes)
@@ -303,7 +333,7 @@ def associate_poses_with_tracks(
     if n_tracks > 0 and n_poses > 0:
         # Build IoU cost matrix
         cost = np.ones((n_tracks, n_poses), dtype=np.float64)
-        for ti, seg_bbox in enumerate(seg_result.tracks.xyxy):
+        for ti, seg_bbox in enumerate(player_bboxes_seg):
             for pi, pose_bbox in enumerate(pose_bboxes):
                 cost[ti, pi] = 1.0 - _bbox_iou(seg_bbox, pose_bbox)
 
@@ -325,9 +355,7 @@ def associate_poses_with_tracks(
                 )
                 for i, ti in enumerate(unmatched_tracks):
                     for j, pi in enumerate(unused_poses):
-                        d = _center_distance(
-                            seg_result.tracks.xyxy[ti], pose_bboxes[pi]
-                        )
+                        d = _center_distance(player_bboxes_seg[ti], pose_bboxes[pi])
                         if d < max_center_dist:
                             dist_cost[i, j] = d
 
@@ -339,14 +367,14 @@ def associate_poses_with_tracks(
                         kp_map[ti] = pi
                         matched_poses.add(pi)
 
-    # -- Build PlayerTrack objects --------------------------------------------
+    # -- Build PlayerTrack objects (players only) -----------------------------
     for ti, (pid, mask, seg_bbox) in enumerate(
-        zip(seg_result.tracks.tracker_id, seg_result.tracks.mask, seg_result.tracks.xyxy)
+        zip(player_ids_arr, player_masks_seg, player_bboxes_seg)
     ):
         pi = kp_map.get(ti)
         player_tracks.append(
             PlayerTrack(
-                id=pid,
+                id=int(pid),
                 mask=mask,
                 bbox=seg_bbox,
                 keypoints=pose_keypoints[pi] if pi is not None else None,
