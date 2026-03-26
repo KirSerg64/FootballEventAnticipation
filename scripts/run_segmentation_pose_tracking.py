@@ -303,6 +303,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "'combined' merges both; keypoint velocities take priority."
         ),
     )
+    # Attractor source and keypoint optical-flow settings
+    parser.add_argument(
+        "--attractor_min_players", type=int, default=3,
+        help=(
+            "Minimum number of players required for the attractor to be active "
+            "when --show_attractor is enabled (default: 3)."
+        ),
+    )      
     parser.add_argument(
         "--kp_flow_backend", default="lk",
         choices=["lk", "cotracker"],
@@ -392,7 +400,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     # Improvement E: tracker selection
     parser.add_argument(
-        "--tracker", default="botsort",
+        "--tracker", default="bytetrack",
         choices=["botsort", "bytetrack"],
         help="Primary tracker algorithm: botsort (default) or bytetrack",
     )
@@ -1085,6 +1093,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
             raw_attractor = estimate_attractor(
                 direction_vectors,
+                min_players = args.attractor_min_players,
                 frame_shape=(frame_h, frame_w),
                 # Ball-centric fast-path: when ball is detected and
                 # --attractor_use_ball is set (default), the expensive
