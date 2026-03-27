@@ -171,16 +171,22 @@ def _compute_flow(model, args_ns, t1: torch.Tensor, t2: torch.Tensor) -> np.ndar
         t1s, t2s = t1, t2
 
     output = model(t1s, t2s, iters=args_ns.iters, test_mode=True)
-    flow = output["flow"][-1]  # [1, 2, H', W']
+    flow_final = output['flow'][-1]
+    info_final = output['info'][-1]
 
     if scale != 0:
         down = 0.5 ** scale
-        flow = (
-            F.interpolate(flow, size=(t1.shape[2], t1.shape[3]), mode="bilinear", align_corners=False)
-            * down
-        )
-
-    return flow[0].permute(1, 2, 0).cpu().numpy()  # [H, W, 2]
+        # flow = (
+        #     F.interpolate(flow_final, size=(t1.shape[2], t1.shape[3]), mode="bilinear", align_corners=False)
+        #     * down
+        # )
+        flow_down = F.interpolate(flow_final, scale_factor=down, mode='bilinear', align_corners=False) * down
+        info_down = F.interpolate(info_final, scale_factor=down, mode='area')
+    else:
+        flow_down, info_down = flow_final, info_final
+    
+    return (flow_down[0].permute(1, 2, 0).cpu().numpy(),  # [H, W, 2]
+            info_down[0].permute(1, 2, 0).cpu().numpy())  # [H, W, C]
 
 
 def _flow_to_bgr(flow_np: np.ndarray) -> np.ndarray:
@@ -284,7 +290,7 @@ def process_video(
             t_curr = _frame_to_tensor(curr_frame, device)
 
             # --- Optical flow ---
-            flow_np = _compute_flow(model, args_ns, t_prev, t_curr)
+            flow_np, info_np = _compute_flow(model, args_ns, t_prev, t_curr)
             flow_bgr = _flow_to_bgr(flow_np)
 
             # Resize flow visualisation to match original frame size (safety)
