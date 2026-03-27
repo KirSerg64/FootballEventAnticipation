@@ -359,6 +359,136 @@ be ignored via `strict=False` loading.
 
 ---
 
+## Appendix: Which Flow Direction Should Be Paired with Frame t?
+
+A key design choice that is not yet settled is whether the gate score `m[t]`
+for frame `t` should be derived from:
+
+- **Backward flow** — `flow(t-1 → t)`: motion that *arrived at* frame t, or  
+- **Forward flow** — `flow(t → t+1)`: motion that *departs from* frame t.
+
+This section analyses both options from first principles.
+
+---
+
+### Option A — Backward Flow `flow(t-1 → t)`
+
+`m[t] = mean_magnitude( flow(t-1 → t) )`
+
+**Semantic meaning:** "How much did the scene change *to produce* frame t?"  
+The gate asks: *did this frame arrive after significant motion?*
+
+**Advantages:**
+
+1. **Strictly causal — no lookahead.**  
+   When processing frame `t` you have already seen frame `t-1`, so
+   `flow(t-1 → t)` is always available without peeking ahead.  
+   This is the standard convention in offline pre-processing pipelines and
+   eliminates any data-leakage concern at the boundary of the observation window.
+
+2. **Straightforward boundary handling.**  
+   The only edge case is the very first frame (`t = 0`), where there is no
+   predecessor frame. Setting `m[0] = 0` (zero magnitude, gate ≈ neutral) is
+   a natural and safe default.
+
+3. **Standard in the optical-flow + video-understanding literature.**  
+   OFF-ViNet (IEEE TIP 2024), which uses per-frame flow weights inside a
+   video saliency transformer, uses backward flow for exactly this reason.
+
+4. **"Landing" frame is still informative.**  
+   A frame that arrives after a sprint, a tackle, or a fast counter-attack
+   carry a lot of information precisely because they are high-motion outcomes.
+   Amplifying such frames is sensible even for anticipation.
+
+**Disadvantage:**
+
+- The gate reflects *past* motion rather than *imminent* motion. A frame
+  immediately before a shot build-up starts would receive a low gate value
+  even though it is the most anticipation-relevant frame in the clip.
+
+---
+
+### Option B — Forward Flow `flow(t → t+1)`
+
+`m[t] = mean_magnitude( flow(t → t+1) )`
+
+**Semantic meaning:** "How much motion will *depart from* frame t?"  
+The gate asks: *is this frame about to become a launch point for significant motion?*
+
+**Advantages:**
+
+1. **Directly anticipatory semantics.**  
+   For an anticipation model the most critical frames are those just *before*
+   an action starts. Forward flow for frame `t` is high precisely when motion
+   is about to begin, so the gate amplifies the "trigger frames" rather than
+   the "result frames."
+
+2. **Better alignment with FAANTRA's goal.**  
+   The FUTR decoder predicts what happens *after* the observation window.
+   Forward-flow gating biases the encoder to store information about
+   the dynamics that are about to unfold, giving the decoder a head start.
+
+**Disadvantages:**
+
+1. **Requires +1 frame lookahead at run time.**  
+   To gate frame `t` with forward flow you need frame `t+1`.  
+   For the *last* observation frame this means peeking one step into the
+   anticipation window — a mild but real form of future leakage.  
+   In offline pre-processing this is not a problem (all frames are on disk),
+   but it complicates any online or streaming use-case.
+
+2. **Last-frame boundary case is non-trivial.**  
+   The final observation frame has no observation-window successor.
+   The choices are: (a) use `m[T] = 0`, (b) use backward flow for the last
+   frame only, or (c) allow the one-frame peek. Each option introduces
+   an inconsistency.
+
+---
+
+### Option C — Centred / Symmetric Flow (compromise)
+
+```
+m[t] = 0.5 * mean_magnitude(flow(t-1 → t))
+       + 0.5 * mean_magnitude(flow(t → t+1))
+```
+
+- Interior frames get a balanced view of incoming and outgoing motion.
+- Edge frame `t = 0` falls back to forward flow only.
+- Edge frame `t = T` falls back to backward flow only.
+- One-frame lookahead is still required for interior frames; this option does
+  not eliminate the practical concern of forward flow but smooths out the
+  semantic asymmetry.
+
+---
+
+### Recommendation
+
+**Primary choice: backward flow `flow(t-1 → t)`.**
+
+Reasons:
+1. Zero lookahead — the pre-computation loop can run strictly left-to-right
+   over the frames already extracted by the setup scripts.
+2. The only edge case (`m[0] = 0`) is trivial.
+3. No boundary inconsistency at the observation-window cutoff.
+4. The anticipation-relevant signal is not completely absent: a frame that
+   arrived after high motion is also a frame from which the *next* high-motion
+   segment is likely to continue (temporal autocorrelation of football dynamics).
+
+**If offline pre-processing and a one-frame lookahead are acceptable:**  
+Use forward flow `flow(t → t+1)` — this is the theoretically purer choice for
+an anticipation task and is recommended as an ablation variant (see the
+ablation table above).
+
+**Suggested ablation entries to add:**
+
+| Run | Flow direction | Purpose |
+|---|---|---|
+| Gate-backward | `flow(t-1 → t)` | Recommended default |
+| Gate-forward | `flow(t → t+1)` | Anticipation-aligned alternative |
+| Gate-centered | 0.5 × (backward + forward) | Symmetric compromise |
+
+---
+
 ## References
 
 - Proposal 4 concept: `optical_flow/integration_suggestions.md` (this repo)
@@ -366,3 +496,4 @@ be ignored via `strict=False` loading.
 - SEA-RAFT: [arxiv.org/abs/2405.14793](https://arxiv.org/abs/2405.14793)
 - GFSalNet (gated fusion with flow, video saliency): [hucvl.github.io/GFSalNet](https://hucvl.github.io/GFSalNet/)
 - SpikingVTG (saliency-feedback gating for video grounding): [openreview.net/pdf?id=30xMvMFtOA](https://openreview.net/pdf?id=30xMvMFtOA)
+- OFF-ViNet (backward flow for frame weighting in video saliency transformer, IEEE TIP 2024): [ieeexplore.ieee.org/document/10508805](https://ieeexplore.ieee.org/document/10508805)
