@@ -48,17 +48,18 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
             step_log_dict = {"train/step": epoch*len(train_loader) + i+1}
             postfix_kwargs = {"loss": 0}
             optimizer.zero_grad()
-            features, past_label, trans_off_future, trans_future_target, target_actionness = data
+            features, past_label, trans_off_future, trans_future_target, target_actionness, observed_flow = data
             features = features.to(device) #[B, S, C]
             past_label = past_label.to(device) #[B, S]
             trans_off_future = trans_off_future.to(device)
             trans_future_target = trans_future_target.to(device)
             trans_off_future_mask = (trans_off_future != pad_idx).long().to(device) # Mask off padding in ground truth predictions. Not relevant when using background
             target_actionness = target_actionness.to(device)
+            observed_flow = observed_flow.to(device) #[B, S, 2, H, W]
 
             target_off = trans_off_future*trans_off_future_mask # Mask off padding in ground truth offsets. Not relevant when using background
             target = trans_future_target
-            inputs = (features, past_label)
+            inputs = (features, past_label, observed_flow) if model.use_optical_flow else (features, past_label)
 
             outputs = model(inputs)
             losses = 0

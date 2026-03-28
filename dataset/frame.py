@@ -55,9 +55,11 @@ class ActionSpotDataset(Dataset):
             use_anchors = False,            # Use temporal anchors for the model
             cheating_dataset = False,       # Cheating dataset that gives model anticipation frames instead of observed frames
             cheating_range = None,          # Range of video to provide when cheating
-            clip_idx_range = None           # (start, end) tuple restricting which clips from the label file are used.
+            clip_idx_range = None,          # (start, end) tuple restricting which clips from the label file are used.
                                             # Enables splitting the 720p/train folder into train and local-val subsets
                                             # without duplicating files.  None means use all clips.
+            use_optical_flow = False,       # Load precomputed optical flow maps alongside RGB frames
+            flow_subdir = 'optical_flow'    # Sub-directory inside each clip folder that holds .npy flow files
             # TODO: Add a specific observation percentage when doing test dataset
     ):
         self._src_file = label_file
@@ -108,10 +110,14 @@ class ActionSpotDataset(Dataset):
 
         # Label modifications
         self._radi_displacement = 0     # Removed via hard coding
-        self._radi_smoothing = radi_smoothing     
+        self._radi_smoothing = radi_smoothing
+
+        # Optical flow
+        self._use_optical_flow = use_optical_flow
+        self._flow_subdir = flow_subdir
 
         #Frame reader class
-        self._frame_reader = FrameReader(frame_dir, dataset = dataset)
+        self._frame_reader = FrameReader(frame_dir, dataset=dataset, flow_subdir=flow_subdir)
 
         #Variables for SN & SNB label paths if datastes
         if (self._dataset == 'soccernet') | (self._dataset == 'soccernetball') | (self._dataset == 'soccernetballanticipation') :
@@ -347,6 +353,9 @@ class ActionSpotDataset(Dataset):
             cheating_end = int(self._cheating_range[1]*vid_len)
             frames = self._frame_reader.load_frames(frames_path, cheating_start, cheating_end, pad=True, stride=self._stride)
             observed_frames = frames[cheating_start:cheating_end]
+            if self._use_optical_flow:
+                flow_frames = self._frame_reader.load_flow_frames(frames_path, cheating_start, cheating_end, pad=True, stride=self._stride)
+                observed_flow = flow_frames[cheating_start:cheating_end]
             # Create array with ground truth label for each frame
             past_labels = np.zeros(len(observed_frames))
             observed_labels_idx = (cheating_start <= all_labels_offsets) & (all_labels_offsets < cheating_end)
@@ -364,6 +373,9 @@ class ActionSpotDataset(Dataset):
             # Get observed frames
             frames = self._frame_reader.load_frames(frames_path, 0, observed_len, pad=True, stride=self._stride)
             observed_frames = frames[:observed_len]
+            if self._use_optical_flow:
+                flow_frames = self._frame_reader.load_flow_frames(frames_path, 0, observed_len, pad=True, stride=self._stride)
+                observed_flow = flow_frames[:observed_len]
             # Create array with ground truth label for each frame
             past_labels = np.zeros(len(observed_frames))
             observed_labels_idx = all_labels_offsets < observed_len
@@ -393,7 +405,8 @@ class ActionSpotDataset(Dataset):
         # Adjust labels to have same length as model prediction, which is #queries
         diff = self._n_query - len(future_labels)
         if diff > 0:
-            # If anticipating background instead of EOS, then we pad with NONE, which now represents background instead of EOS for the rest of the sequence
+            # If anticipating background instead of EOS, then we pad with NONE, which now represents background instead 
+            # of EOS for the rest of the sequence
             # When using actionness there will be no EOS, and we want the rest of the sequence to be padding
             tmp = (np.ones(diff) * self.NONE) if self._anticipate_background else (np.ones(diff) * self._label_pad_idx)
             future_labels = np.concatenate((future_labels, tmp))
@@ -409,7 +422,8 @@ class ActionSpotDataset(Dataset):
         # Create actionness
         actionness = np.where(future_labels == self._label_pad_idx, 0, 1) if self._use_actionness else np.zeros_like(future_labels)
 
-        # Create anchors: Go through action, offset pair. Use offset to determine anchor class. If 2 classes are in same anchor, then cry about it (Take last one)
+        # Create anchors: Go through action, offset pair. Use offset to determine anchor class. 
+        # If 2 classes are in same anchor, then cry about it (Take last one)
         # Anchor_Offset: Is the number of frames forward within the anchor, so with 32 frames and 8 anchors it's between 0-3.
         anchor_offset = np.ones_like(future_offsets) * self._label_pad_idx
         anchor_labels = np.ones_like(future_labels) * self.NONE if self._anticipate_background else np.ones_like(future_labels) * self._label_pad_idx
@@ -427,6 +441,8 @@ class ActionSpotDataset(Dataset):
                 'future_offset':torch.tensor(anchor_offset if self._use_anchors else future_offsets, dtype=torch.float32),
                 'future_target':torch.tensor(anchor_labels if self._use_anchors else future_labels, dtype=torch.float32),
                 'actionness':torch.tensor(actionness, dtype=torch.float32)}
+        if self._use_optical_flow:
+            item['flow'] = observed_flow
         return item
 
     def __getitem__(self, unused):
@@ -456,6 +472,11 @@ class ActionSpotDataset(Dataset):
 
         batch = [b_features, b_past_label, b_trans_future_off, b_trans_future_target, b_actionness]
 
+        if self._use_optical_flow:
+            b_flow = [item['flow'] for item in batch]
+            b_flow = torch.nn.utils.rnn.pad_sequence(b_flow, batch_first=True, padding_value=0)  # [B, T, 2, H, W]
+            batch.append(b_flow)
+
         return batch
 
     def __len__(self):
@@ -468,13 +489,69 @@ class ActionSpotDataset(Dataset):
 # Directly from: https://github.com/arturxe2/T-DEED_v2/blob/main/dataset/frame.py
 class FrameReader:
 
-    def __init__(self, frame_dir, dataset):
+    def __init__(self, frame_dir, dataset, flow_subdir='optical_flow'):
         self._frame_dir = frame_dir
         self.dataset = dataset
+        self._flow_subdir = flow_subdir
 
     def read_frame(self, frame_path):
         img = torchvision.io.read_image(frame_path)
         return img
+
+    def read_flow(self, flow_path):
+        """Load a .npy flow file and return a [2, H, W] float32 tensor."""
+        flow = np.load(flow_path).astype(np.float32)  # [H, W, 2]
+        return torch.from_numpy(flow).permute(2, 0, 1)  # [2, H, W]
+
+    def load_flow_frames(self, paths, start_index, end_index, pad=False, stride=1):
+        """Load optical flow maps for the same window as load_frames.
+
+        Flow files are expected at <base_path>/optical_flow/frame<N>.npy.
+        Zero tensors [2, H, W] are returned for padded positions or missing files.
+        """
+        base_path = paths[0]
+        start = paths[1]
+        pad_start = paths[2]
+        pad_end = paths[3]
+        ndigits = paths[4]
+        length = paths[5]
+        flow_dir = os.path.join(base_path, self._flow_subdir)
+
+        ret = []
+        if ndigits == -1:
+            # Determine zero tensor shape from the first available flow file
+            _probe_path = os.path.join(flow_dir, 'frame' + str(start) + '.npy')
+            if os.path.isfile(_probe_path):
+                zero_flow = torch.zeros_like(self.read_flow(_probe_path))
+            else:
+                zero_flow = torch.zeros(2, 1, 1, dtype=torch.float32)
+            for j in range(length - pad_start - pad_end):
+                if (j >= (start_index - pad_start)) and (j < (end_index - pad_start)):
+                    fp = os.path.join(flow_dir, 'frame' + str(start + j * stride) + '.npy')
+                    ret.append(self.read_flow(fp) if os.path.isfile(fp) else zero_flow)
+                else:
+                    ret.append(zero_flow)
+        else:
+            _probe_path = os.path.join(flow_dir, str(start).zfill(ndigits) + '.npy')
+            if os.path.isfile(_probe_path):
+                zero_flow = torch.zeros_like(self.read_flow(_probe_path))
+            else:
+                zero_flow = torch.zeros(2, 1, 1, dtype=torch.float32)
+            for j in range(length - pad_start - pad_end):
+                if (j >= (start_index - pad_start)) and (j < (end_index - pad_start)):
+                    fp = os.path.join(flow_dir, str(start + j * stride).zfill(ndigits) + '.npy')
+                    ret.append(self.read_flow(fp) if os.path.isfile(fp) else zero_flow)
+                else:
+                    ret.append(zero_flow)
+
+        ret = torch.stack(ret, dim=0)  # [T, 2, H, W]
+
+        if pad_start > 0 or (pad and pad_end > 0):
+            # Pad along the time dimension (dim 0); spatial dims are last two
+            ret = torch.nn.functional.pad(
+                ret, (0, 0, 0, 0, 0, 0, pad_start, pad_end if pad else 0))
+
+        return ret
     
     def load_paths(self, video_name, start, end, stride=1, source_info = None):
 

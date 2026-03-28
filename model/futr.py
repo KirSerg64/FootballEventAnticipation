@@ -19,7 +19,8 @@ sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 class FUTR(nn.Module):
 
     def __init__(self, n_class, hidden_dim, src_pad_idx, device, args, n_query=8, n_head=8,
-                 num_encoder_layers=6, num_decoder_layers=6, src_attn_mask=None, tgt_attn_mask=None):
+                 num_encoder_layers=6, num_decoder_layers=6, src_attn_mask=None, tgt_attn_mask=None,
+                 use_optical_flow=False):
         super().__init__()
         if num_decoder_layers < 1 and n_query > 1:
             raise ValueError(f"n_query must be 1 if no decoder is to be used\nGiven values are: {n_query} and {num_decoder_layers} respectively")
@@ -32,6 +33,7 @@ class FUTR(nn.Module):
         self.src_attn_mask = src_attn_mask
         self.tgt_attn_mask = tgt_attn_mask
         self.jointtrain_available = args.jointtrain is not None
+        self.use_optical_flow = use_optical_flow
         if self.feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
             self.features = timm.create_model({
                 'rny002': 'regnety_002',
@@ -47,6 +49,11 @@ class FUTR(nn.Module):
         else:
             raise NotImplementedError(args.feature_arch)
         
+        # add optical flow features if specified
+        if self.use_optical_flow:
+            self.input_dim += 2  # Assuming optical flow has 2 channels (horizontal and vertical)
+
+
         # Add Temporal Shift Modules
         # NOTE: NEED TO CHANGE 2ND ARGUMENT FOR CHEATING DATASET
         max_obs_len = int(args.clip_len*args.cheating_range[1])-int(args.clip_len*args.cheating_range[0]) if args.cheating_dataset else int(args.clip_len*max(args.obs_perc))
@@ -132,18 +139,30 @@ class FUTR(nn.Module):
     # TODO: Implement proper frame pre-processing
     def forward(self, inputs, mode='train'):
         if mode == 'train' :
-            src, src_label = inputs
+            if self.use_optical_flow:
+                src, src_label, src_flow = inputs
+            else:
+                src, src_label = inputs
+                src_flow = None
             tgt_key_padding_mask = None
             src_key_padding_mask = get_pad_mask(src_label, self.src_pad_idx).to(self.device)
             memory_key_padding_mask = src_key_padding_mask.clone().to(self.device)
         else :
-            src = inputs
+            if self.use_optical_flow:
+                src, src_flow = inputs
+            else:
+                src = inputs
+                src_flow = None
             src_key_padding_mask = None
             memory_key_padding_mask = None
             tgt_key_padding_mask = None
 
         src_mask = self.src_attn_mask
         tgt_mask = self.tgt_attn_mask
+
+        #concat optical flow features if specified
+        if self.use_optical_flow and src_flow is not None:
+            src = torch.cat((src, src_flow), dim=2)  # Assuming src is [B, S, C, H, W] and src_flow is [B, S, 2, H, W]
 
         B, S, C, H, W = src.size()
         src = src/255.0         # Normalize
