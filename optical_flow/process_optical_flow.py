@@ -50,6 +50,7 @@ Full argument reference
   --iters         RAFT refinement iterations                                (default: from config)
   --scale         Spatial scale exponent                                    (default: from config)
   --output_subdir Subdirectory name inside each clip for flow files         (default: optical_flow)
+  --batch_size    Number of frame pairs to process in one forward pass      (default: 1)
   --no_skip       Recompute even if output files already exist
 """
 
@@ -61,6 +62,7 @@ import sys
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ from test_optical_flow import (  # noqa: E402
 # ---------------------------------------------------------------------------
 _DEFAULT_FLOW_SUBDIR = "optical_flow"
 _FRAME_PATTERN = re.compile(r"^frame(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
+_DEFAULT_BATCH_SIZE = 1
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +127,53 @@ def _all_flow_files_exist(flow_dir: str, frame_names: list) -> bool:
     )
 
 
+@torch.no_grad()
+def _compute_flow_batch(
+    model,
+    args_ns,
+    t1_batch: torch.Tensor,
+    t2_batch: torch.Tensor,
+) -> np.ndarray:
+    """Run SEA-RAFT on a batch of frame pairs and return all flow maps.
+
+    Mirrors :func:`_compute_flow` from ``test_optical_flow`` but operates on
+    an arbitrary-sized batch rather than a single pair.
+
+    Args:
+        model:     Loaded SEA-RAFT model (already on the target device).
+        args_ns:   SEA-RAFT config namespace (``iters``, ``scale``, …).
+        t1_batch:  Previous frames, shape ``[B, 3, H, W]``, float32.
+        t2_batch:  Current  frames, shape ``[B, 3, H, W]``, float32.
+
+    Returns:
+        NumPy array of shape ``[B, H, W, 2]``, float32, in the original
+        spatial resolution.
+    """
+    scale = getattr(args_ns, "scale", -1)
+
+    if scale != 0:
+        up = 2.0 ** scale
+        t1s = F.interpolate(t1_batch, scale_factor=up, mode="bilinear", align_corners=False)
+        t2s = F.interpolate(t2_batch, scale_factor=up, mode="bilinear", align_corners=False)
+    else:
+        t1s, t2s = t1_batch, t2_batch
+
+    output = model(t1s, t2s, iters=args_ns.iters, test_mode=True)
+    flow_final = output['flow'][-1]   # [B, 2, H_s, W_s]
+
+    if scale != 0:
+        down = 0.5 ** scale
+        flow_down = (
+            F.interpolate(flow_final, scale_factor=down, mode='bilinear', align_corners=False)
+            * down
+        )
+    else:
+        flow_down = flow_final
+
+    # [B, 2, H, W] → [B, H, W, 2]
+    return flow_down.permute(0, 2, 3, 1).cpu().numpy()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -140,6 +190,7 @@ def precompute_optical_flow(
     splits: list = None,
     output_subdir: str = _DEFAULT_FLOW_SUBDIR,
     skip_existing: bool = True,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> None:
     """Precompute SEA-RAFT optical flow for all clips in a dataset split.
 
@@ -190,11 +241,18 @@ def precompute_optical_flow(
         skip_existing:
             When ``True`` (default), clips whose flow files are already
             fully present are skipped without re-running inference.
+        batch_size:
+            Number of consecutive frame pairs to stack into a single
+            batched forward pass.  Values greater than 1 improve GPU
+            utilisation at the cost of proportionally more VRAM.
+            Defaults to ``1`` (original single-pair behaviour).
     """
     # ── device ────────────────────────────────────────────────────────────
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
+    batch_size = max(1, batch_size)
+    print(f"[INFO] Batch size:   {batch_size}")
 
     # ── SEA-RAFT path & model ─────────────────────────────────────────────
     _add_sea_raft_to_path(sea_raft_dir)
@@ -250,38 +308,57 @@ def precompute_optical_flow(
 
             os.makedirs(flow_dir, exist_ok=True)
 
-            # ── per-clip forward pass ──────────────────────────────────────
-            t_prev = None
-            for frame_name in frame_names:
-                frame_path = os.path.join(clip_dir, frame_name)
+            # ── build list of pairs that need computing ────────────────────
+            # Each entry: (out_path, prev_frame_path, curr_frame_path)
+            # The first frame is handled separately (zero flow, no pair).
+            pairs_to_compute = []
+            for i, frame_name in enumerate(frame_names):
                 stem = os.path.splitext(frame_name)[0]
                 out_path = os.path.join(flow_dir, stem + ".npy")
+                frame_path = os.path.join(clip_dir, frame_name)
 
-                # When resuming a partial clip, keep t_prev in sync without
-                # re-running inference for frames that already have output.
+                if i == 0:
+                    # First frame – no predecessor; write zero map if absent.
+                    if not (skip_existing and os.path.isfile(out_path)):
+                        frame_bgr = cv2.imread(frame_path)
+                        if frame_bgr is None:
+                            print(f"[WARN] Could not read frame, skipping: {frame_path}")
+                            continue
+                        h, w = frame_bgr.shape[:2]
+                        np.save(out_path, np.zeros((h, w, 2), dtype=np.float32))
+                    continue
+
                 if skip_existing and os.path.isfile(out_path):
-                    frame_bgr = cv2.imread(frame_path)
-                    if frame_bgr is not None:
-                        t_prev = _frame_to_tensor(frame_bgr, device)
                     continue
 
-                frame_bgr = cv2.imread(frame_path)
-                if frame_bgr is None:
-                    print(f"[WARN] Could not read frame, skipping: {frame_path}")
-                    t_prev = None
+                prev_path = os.path.join(clip_dir, frame_names[i - 1])
+                pairs_to_compute.append((out_path, prev_path, frame_path))
+
+            # ── process pairs in batches ───────────────────────────────────
+            for batch_start in range(0, len(pairs_to_compute), batch_size):
+                batch = pairs_to_compute[batch_start : batch_start + batch_size]
+
+                t_prevs, t_currs, valid_idx = [], [], []
+                for k, (_, prev_path, curr_path) in enumerate(batch):
+                    prev_bgr = cv2.imread(prev_path)
+                    curr_bgr = cv2.imread(curr_path)
+                    if prev_bgr is None or curr_bgr is None:
+                        missing = prev_path if prev_bgr is None else curr_path
+                        print(f"[WARN] Could not read frame, skipping: {missing}")
+                        continue
+                    t_prevs.append(_frame_to_tensor(prev_bgr, device))  # [1, 3, H, W]
+                    t_currs.append(_frame_to_tensor(curr_bgr, device))  # [1, 3, H, W]
+                    valid_idx.append(k)
+
+                if not valid_idx:
                     continue
 
-                t_curr = _frame_to_tensor(frame_bgr, device)
+                t1_batch = torch.cat(t_prevs, dim=0)  # [B, 3, H, W]
+                t2_batch = torch.cat(t_currs, dim=0)  # [B, 3, H, W]
+                flows = _compute_flow_batch(model, args_ns, t1_batch, t2_batch)  # [B, H, W, 2]
 
-                if t_prev is None:
-                    # First frame — no predecessor; store zero flow
-                    h, w = frame_bgr.shape[:2]
-                    flow_np = np.zeros((h, w, 2), dtype=np.float32)
-                else:
-                    flow_np, _ = _compute_flow(model, args_ns, t_prev, t_curr)
-
-                np.save(out_path, flow_np)
-                t_prev = t_curr
+                for result_idx, batch_idx in enumerate(valid_idx):
+                    np.save(batch[batch_idx][0], flows[result_idx])
 
             total_clips_processed += 1
 
@@ -341,6 +418,10 @@ def _parse_args() -> argparse.Namespace:
         help="Sub-directory name inside each clip folder for .npy flow files",
     )
     parser.add_argument(
+        "--batch_size", type=int, default=_DEFAULT_BATCH_SIZE,
+        help="Number of frame pairs to process in one batched forward pass",
+    )
+    parser.add_argument(
         "--no_skip", action="store_true",
         help="Recompute flow even if output files already exist",
     )
@@ -364,6 +445,7 @@ def main() -> None:
         splits=args.splits,
         output_subdir=args.output_subdir,
         skip_existing=not args.no_skip,
+        batch_size=args.batch_size,
     )
 
 
