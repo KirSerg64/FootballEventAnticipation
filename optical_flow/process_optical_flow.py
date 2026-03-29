@@ -76,7 +76,6 @@ from test_optical_flow import (  # noqa: E402
     _DEFAULT_MODEL_URL,
     _add_sea_raft_to_path,
     _build_args_ns,
-    _compute_flow,
     _frame_to_tensor,
     _load_model,
 )
@@ -308,57 +307,64 @@ def precompute_optical_flow(
 
             os.makedirs(flow_dir, exist_ok=True)
 
-            # ── build list of pairs that need computing ────────────────────
-            # Each entry: (out_path, prev_frame_path, curr_frame_path)
-            # The first frame is handled separately (zero flow, no pair).
-            pairs_to_compute = []
-            for i, frame_name in enumerate(frame_names):
+            # ── streaming single-pass with t_prev carry-forward ────────────
+            # Each frame is read exactly once.  t_prev is reused from the
+            # previous iteration — no redundant disk reads.
+            # Pending (t_prev, t_curr, out_path) tuples are flushed as a
+            # batch when the buffer reaches batch_size or the clip ends.
+
+            pending_t1: list = []   # previous-frame tensors  [1, 3, H, W]
+            pending_t2: list = []   # current-frame  tensors  [1, 3, H, W]
+            pending_out: list = []  # corresponding output paths
+
+            def _flush() -> None:
+                if not pending_t1:
+                    return
+                t1_b = torch.cat(pending_t1, dim=0)
+                t2_b = torch.cat(pending_t2, dim=0)
+                flows = _compute_flow_batch(model, args_ns, t1_b, t2_b)
+                for flow, op in zip(flows, pending_out):
+                    np.save(op, flow)
+                pending_t1.clear()
+                pending_t2.clear()
+                pending_out.clear()
+
+            t_prev = None
+            for frame_name in frame_names:
+                frame_path = os.path.join(clip_dir, frame_name)
                 stem = os.path.splitext(frame_name)[0]
                 out_path = os.path.join(flow_dir, stem + ".npy")
-                frame_path = os.path.join(clip_dir, frame_name)
 
-                if i == 0:
-                    # First frame – no predecessor; write zero map if absent.
+                frame_bgr = cv2.imread(frame_path)
+                if frame_bgr is None:
+                    print(f"[WARN] Could not read frame, skipping: {frame_path}")
+                    _flush()        # commit any pending batch before the gap
+                    t_prev = None
+                    continue
+
+                t_curr = _frame_to_tensor(frame_bgr, device)
+
+                if t_prev is None:
+                    # First usable frame — write zero flow, no pair to compute.
                     if not (skip_existing and os.path.isfile(out_path)):
-                        frame_bgr = cv2.imread(frame_path)
-                        if frame_bgr is None:
-                            print(f"[WARN] Could not read frame, skipping: {frame_path}")
-                            continue
                         h, w = frame_bgr.shape[:2]
                         np.save(out_path, np.zeros((h, w, 2), dtype=np.float32))
-                    continue
+                else:
+                    if not (skip_existing and os.path.isfile(out_path)):
+                        pending_t1.append(t_prev)
+                        pending_t2.append(t_curr)
+                        pending_out.append(out_path)
+                        if len(pending_t1) >= batch_size:
+                            _flush()
 
-                if skip_existing and os.path.isfile(out_path):
-                    continue
+                t_prev = t_curr  # reuse — no re-read on the next iteration
 
-                prev_path = os.path.join(clip_dir, frame_names[i - 1])
-                pairs_to_compute.append((out_path, prev_path, frame_path))
+            _flush()  # commit any remaining pairs at end of clip
 
-            # ── process pairs in batches ───────────────────────────────────
-            for batch_start in range(0, len(pairs_to_compute), batch_size):
-                batch = pairs_to_compute[batch_start : batch_start + batch_size]
-
-                t_prevs, t_currs, valid_idx = [], [], []
-                for k, (_, prev_path, curr_path) in enumerate(batch):
-                    prev_bgr = cv2.imread(prev_path)
-                    curr_bgr = cv2.imread(curr_path)
-                    if prev_bgr is None or curr_bgr is None:
-                        missing = prev_path if prev_bgr is None else curr_path
-                        print(f"[WARN] Could not read frame, skipping: {missing}")
-                        continue
-                    t_prevs.append(_frame_to_tensor(prev_bgr, device))  # [1, 3, H, W]
-                    t_currs.append(_frame_to_tensor(curr_bgr, device))  # [1, 3, H, W]
-                    valid_idx.append(k)
-
-                if not valid_idx:
-                    continue
-
-                t1_batch = torch.cat(t_prevs, dim=0)  # [B, 3, H, W]
-                t2_batch = torch.cat(t_currs, dim=0)  # [B, 3, H, W]
-                flows = _compute_flow_batch(model, args_ns, t1_batch, t2_batch)  # [B, H, W, 2]
-
-                for result_idx, batch_idx in enumerate(valid_idx):
-                    np.save(batch[batch_idx][0], flows[result_idx])
+            # Free cached CUDA allocations accumulated during this clip so
+            # the allocator's free-block list stays small across clips.
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             total_clips_processed += 1
 
