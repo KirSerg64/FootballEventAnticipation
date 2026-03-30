@@ -86,6 +86,7 @@ from test_optical_flow import (  # noqa: E402
 _DEFAULT_FLOW_SUBDIR = "optical_flow"
 _FRAME_PATTERN = re.compile(r"^frame(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
 _DEFAULT_BATCH_SIZE = 1
+_DEFAULT_VIDEO_FPS = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +119,16 @@ def _sorted_frame_names(clip_dir: str) -> list:
     return [name for _, name in pairs]
 
 
-def _all_flow_files_exist(flow_dir: str, frame_names: list) -> bool:
-    """Return ``True`` iff every frame already has a corresponding flow file."""
+def _all_flow_files_exist(flow_dir: str, frame_names: list, flow_stride: int = 1) -> bool:
+    """Return ``True`` iff every expected flow file is already present.
+
+    With *flow_stride* > 1 only every *flow_stride*-th frame is stored,
+    so only those frames are checked.
+    """
     return all(
         os.path.isfile(os.path.join(flow_dir, os.path.splitext(n)[0] + ".npy"))
-        for n in frame_names
+        for i, n in enumerate(frame_names)
+        if i % flow_stride == 0
     )
 
 
@@ -160,17 +166,10 @@ def _compute_flow_batch(
     output = model(t1s, t2s, iters=args_ns.iters, test_mode=True)
     flow_final = output['flow'][-1]   # [B, 2, H_s, W_s]
 
-    if scale != 0:
-        down = 0.5 ** scale
-        flow_down = (
-            F.interpolate(flow_final, scale_factor=down, mode='bilinear', align_corners=False)
-            * down
-        )
-    else:
-        flow_down = flow_final
-
-    # [B, 2, H, W] → [B, H, W, 2]
-    return flow_down.permute(0, 2, 3, 1).cpu().numpy()
+    # Return at SEA-RAFT native resolution (half-res when scale=-1).
+    # Values are in scaled-pixel units; the loader rescales on upsample.
+    # [B, 2, H_s, W_s] → [B, H_s, W_s, 2], stored as float16 to halve disk space.
+    return flow_final.permute(0, 2, 3, 1).cpu().to(torch.float16).numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +189,8 @@ def precompute_optical_flow(
     output_subdir: str = _DEFAULT_FLOW_SUBDIR,
     skip_existing: bool = True,
     batch_size: int = _DEFAULT_BATCH_SIZE,
+    flow_fps: float = None,
+    video_fps: float = _DEFAULT_VIDEO_FPS,
 ) -> None:
     """Precompute SEA-RAFT optical flow for all clips in a dataset split.
 
@@ -253,6 +254,14 @@ def precompute_optical_flow(
     batch_size = max(1, batch_size)
     print(f"[INFO] Batch size:   {batch_size}")
 
+    # ── FPS subsampling ───────────────────────────────────────────────────
+    if flow_fps is not None and flow_fps > 0:
+        flow_stride = max(1, round(video_fps / flow_fps))
+        print(f"[INFO] Flow FPS:     {flow_fps:.1f}  (every {flow_stride} frame(s))")
+    else:
+        flow_stride = 1
+        print(f"[INFO] Flow FPS:     all frames")
+
     # ── SEA-RAFT path & model ─────────────────────────────────────────────
     _add_sea_raft_to_path(sea_raft_dir)
     args_ns = _build_args_ns(config, iters, scale)
@@ -301,7 +310,7 @@ def precompute_optical_flow(
                 # Clip directory has no extracted frames (e.g. only 720p.mp4)
                 continue
 
-            if skip_existing and _all_flow_files_exist(flow_dir, frame_names):
+            if skip_existing and _all_flow_files_exist(flow_dir, frame_names, flow_stride):
                 total_clips_skipped += 1
                 continue
 
@@ -330,10 +339,13 @@ def precompute_optical_flow(
                 pending_out.clear()
 
             t_prev = None
-            for frame_name in frame_names:
+            _scale = getattr(args_ns, 'scale', -1)
+            for frame_0idx, frame_name in enumerate(frame_names):
                 frame_path = os.path.join(clip_dir, frame_name)
                 stem = os.path.splitext(frame_name)[0]
                 out_path = os.path.join(flow_dir, stem + ".npy")
+
+                should_store = (frame_0idx % flow_stride == 0)
 
                 frame_bgr = cv2.imread(frame_path)
                 if frame_bgr is None:
@@ -345,19 +357,25 @@ def precompute_optical_flow(
                 t_curr = _frame_to_tensor(frame_bgr, device)
 
                 if t_prev is None:
-                    # First usable frame — write zero flow, no pair to compute.
-                    if not (skip_existing and os.path.isfile(out_path)):
+                    # First usable frame — write zero flow at SEA-RAFT native
+                    # resolution (half-res for scale=-1), stored as float16.
+                    if should_store and not (skip_existing and os.path.isfile(out_path)):
                         h, w = frame_bgr.shape[:2]
-                        np.save(out_path, np.zeros((h, w, 2), dtype=np.float32))
+                        if _scale != 0:
+                            up = 2.0 ** _scale
+                            hs, ws = int(round(h * up)), int(round(w * up))
+                        else:
+                            hs, ws = h, w
+                        np.save(out_path, np.zeros((hs, ws, 2), dtype=np.float16))
                 else:
-                    if not (skip_existing and os.path.isfile(out_path)):
+                    if should_store and not (skip_existing and os.path.isfile(out_path)):
                         pending_t1.append(t_prev)
                         pending_t2.append(t_curr)
                         pending_out.append(out_path)
                         if len(pending_t1) >= batch_size:
                             _flush()
 
-                t_prev = t_curr  # reuse — no re-read on the next iteration
+                t_prev = t_curr  # always advance — no re-read on next iteration
 
             _flush()  # commit any remaining pairs at end of clip
 
@@ -428,6 +446,15 @@ def _parse_args() -> argparse.Namespace:
         help="Number of frame pairs to process in one batched forward pass",
     )
     parser.add_argument(
+        "--video_fps", type=float, default=_DEFAULT_VIDEO_FPS,
+        help="Frame rate of the source videos (used to derive the flow stride)",
+    )
+    parser.add_argument(
+        "--flow_fps", type=float, default=None,
+        help="Target flow frame rate; e.g. 12.5 stores every other frame at 25 fps. "
+             "None (default) stores flow for every frame.",
+    )
+    parser.add_argument(
         "--no_skip", action="store_true",
         help="Recompute flow even if output files already exist",
     )
@@ -452,6 +479,8 @@ def main() -> None:
         output_subdir=args.output_subdir,
         skip_existing=not args.no_skip,
         batch_size=args.batch_size,
+        flow_fps=args.flow_fps,
+        video_fps=args.video_fps,
     )
 
 

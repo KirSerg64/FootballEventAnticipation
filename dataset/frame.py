@@ -59,7 +59,9 @@ class ActionSpotDataset(Dataset):
                                             # Enables splitting the 720p/train folder into train and local-val subsets
                                             # without duplicating files.  None means use all clips.
             use_optical_flow = False,       # Load precomputed optical flow maps alongside RGB frames
-            flow_subdir = 'optical_flow'    # Sub-directory inside each clip folder that holds .npy flow files
+            flow_subdir = 'optical_flow',   # Sub-directory inside each clip folder that holds .npy flow files
+            flow_fps = None,                # Target flow frame rate used during precomputation; None = every frame
+            video_fps = FPS_SN,             # Source video frame rate (used to derive flow_stride)
             # TODO: Add a specific observation percentage when doing test dataset
     ):
         self._src_file = label_file
@@ -115,6 +117,7 @@ class ActionSpotDataset(Dataset):
         # Optical flow
         self._use_optical_flow = use_optical_flow
         self._flow_subdir = flow_subdir
+        self._flow_stride = max(1, round(video_fps / flow_fps)) if flow_fps is not None else 1
 
         #Frame reader class
         self._frame_reader = FrameReader(frame_dir, dataset=dataset, flow_subdir=flow_subdir)
@@ -354,7 +357,10 @@ class ActionSpotDataset(Dataset):
             frames = self._frame_reader.load_frames(frames_path, cheating_start, cheating_end, pad=True, stride=self._stride)
             observed_frames = frames[cheating_start:cheating_end]
             if self._use_optical_flow:
-                flow_frames = self._frame_reader.load_flow_frames(frames_path, cheating_start, cheating_end, pad=True, stride=self._stride)
+                flow_frames = self._frame_reader.load_flow_frames(
+                    frames_path, cheating_start, cheating_end, pad=True, stride=self._stride,
+                    flow_stride=self._flow_stride,
+                    target_size=(frames.shape[-2], frames.shape[-1]))
                 observed_flow = flow_frames[cheating_start:cheating_end]
             # Create array with ground truth label for each frame
             past_labels = np.zeros(len(observed_frames))
@@ -374,7 +380,10 @@ class ActionSpotDataset(Dataset):
             frames = self._frame_reader.load_frames(frames_path, 0, observed_len, pad=True, stride=self._stride)
             observed_frames = frames[:observed_len]
             if self._use_optical_flow:
-                flow_frames = self._frame_reader.load_flow_frames(frames_path, 0, observed_len, pad=True, stride=self._stride)
+                flow_frames = self._frame_reader.load_flow_frames(
+                    frames_path, 0, observed_len, pad=True, stride=self._stride,
+                    flow_stride=self._flow_stride,
+                    target_size=(frames.shape[-2], frames.shape[-1]))
                 observed_flow = flow_frames[:observed_len]
             # Create array with ground truth label for each frame
             past_labels = np.zeros(len(observed_frames))
@@ -470,10 +479,11 @@ class ActionSpotDataset(Dataset):
         b_trans_future_target = torch.nn.utils.rnn.pad_sequence(b_trans_future_target, batch_first=True, padding_value=self._label_pad_idx)
         b_actionness = torch.nn.utils.rnn.pad_sequence(b_actionness, batch_first=True, padding_value=self._label_pad_idx)
 
+        original_batch = batch  # keep dict list before reassignment
         batch = [b_features, b_past_label, b_trans_future_off, b_trans_future_target, b_actionness]
 
         if self._use_optical_flow:
-            b_flow = [item['flow'] for item in batch]
+            b_flow = [item['flow'] for item in original_batch]
             b_flow = torch.nn.utils.rnn.pad_sequence(b_flow, batch_first=True, padding_value=0)  # [B, T, 2, H, W]
             batch.append(b_flow)
 
@@ -498,16 +508,38 @@ class FrameReader:
         img = torchvision.io.read_image(frame_path)
         return img
 
-    def read_flow(self, flow_path):
-        """Load a .npy flow file and return a [2, H, W] float32 tensor."""
-        flow = np.load(flow_path).astype(np.float32)  # [H, W, 2]
-        return torch.from_numpy(flow).permute(2, 0, 1)  # [2, H, W]
+    def read_flow(self, flow_path, target_size=None):
+        """Load a .npy flow file and return a [2, H, W] float32 tensor.
 
-    def load_flow_frames(self, paths, start_index, end_index, pad=False, stride=1):
+        If *target_size* ``(H, W)`` is given and the stored flow is at a
+        lower resolution it is bilinearly upsampled and values are scaled
+        proportionally to match full-pixel displacements.
+        """
+        flow = np.load(flow_path).astype(np.float32)  # [H, W, 2]
+        t = torch.from_numpy(flow).permute(2, 0, 1)   # [2, H, W]
+        if target_size is not None:
+            th, tw = target_size
+            if t.shape[1] != th or t.shape[2] != tw:
+                scale_factor = th / t.shape[1]
+                t = torch.nn.functional.interpolate(
+                    t.unsqueeze(0), size=(th, tw), mode='bilinear', align_corners=False
+                ).squeeze(0) * scale_factor
+        return t
+
+    def load_flow_frames(self, paths, start_index, end_index, pad=False, stride=1,
+                         flow_stride=1, target_size=None):
         """Load optical flow maps for the same window as load_frames.
 
         Flow files are expected at <base_path>/optical_flow/frame<N>.npy.
         Zero tensors [2, H, W] are returned for padded positions or missing files.
+
+        Args:
+            flow_stride: Spacing between stored flow frames matching the value
+                used during precomputation.  Frame indices are snapped to the
+                nearest preceding stored frame before the file lookup.
+            target_size: Optional ``(H, W)`` tuple.  When the stored flow is at
+                a lower resolution it is bilinearly upsampled to this size and
+                values are scaled proportionally.
         """
         base_path = paths[0]
         start = paths[1]
@@ -517,32 +549,41 @@ class FrameReader:
         length = paths[5]
         flow_dir = os.path.join(base_path, self._flow_subdir)
 
+        # Build zero tensor at correct spatial size; deferred until first probe.
+        _zero: list = [None]
+
+        def _get_zero(probe_path=None):
+            if _zero[0] is None:
+                if target_size is not None:
+                    _zero[0] = torch.zeros(2, target_size[0], target_size[1], dtype=torch.float32)
+                elif probe_path is not None and os.path.isfile(probe_path):
+                    _zero[0] = torch.zeros_like(self.read_flow(probe_path, target_size))
+                else:
+                    _zero[0] = torch.zeros(2, 1, 1, dtype=torch.float32)
+            return _zero[0]
+
         ret = []
         if ndigits == -1:
-            # Determine zero tensor shape from the first available flow file
             _probe_path = os.path.join(flow_dir, 'frame' + str(start) + '.npy')
-            if os.path.isfile(_probe_path):
-                zero_flow = torch.zeros_like(self.read_flow(_probe_path))
-            else:
-                zero_flow = torch.zeros(2, 1, 1, dtype=torch.float32)
             for j in range(length - pad_start - pad_end):
                 if (j >= (start_index - pad_start)) and (j < (end_index - pad_start)):
-                    fp = os.path.join(flow_dir, 'frame' + str(start + j * stride) + '.npy')
-                    ret.append(self.read_flow(fp) if os.path.isfile(fp) else zero_flow)
+                    frame_idx = start + j * stride
+                    # Snap to the nearest preceding stored flow frame.
+                    if flow_stride > 1:
+                        frame_idx = 1 + ((frame_idx - 1) // flow_stride) * flow_stride
+                    fp = os.path.join(flow_dir, 'frame' + str(frame_idx) + '.npy')
+                    ret.append(self.read_flow(fp, target_size) if os.path.isfile(fp) else _get_zero(_probe_path))
                 else:
-                    ret.append(zero_flow)
+                    ret.append(_get_zero(_probe_path))
         else:
             _probe_path = os.path.join(flow_dir, str(start).zfill(ndigits) + '.npy')
-            if os.path.isfile(_probe_path):
-                zero_flow = torch.zeros_like(self.read_flow(_probe_path))
-            else:
-                zero_flow = torch.zeros(2, 1, 1, dtype=torch.float32)
             for j in range(length - pad_start - pad_end):
                 if (j >= (start_index - pad_start)) and (j < (end_index - pad_start)):
-                    fp = os.path.join(flow_dir, str(start + j * stride).zfill(ndigits) + '.npy')
-                    ret.append(self.read_flow(fp) if os.path.isfile(fp) else zero_flow)
+                    frame_idx = start + j * stride
+                    fp = os.path.join(flow_dir, str(frame_idx).zfill(ndigits) + '.npy')
+                    ret.append(self.read_flow(fp, target_size) if os.path.isfile(fp) else _get_zero(_probe_path))
                 else:
-                    ret.append(zero_flow)
+                    ret.append(_get_zero(_probe_path))
 
         ret = torch.stack(ret, dim=0)  # [T, 2, H, W]
 
