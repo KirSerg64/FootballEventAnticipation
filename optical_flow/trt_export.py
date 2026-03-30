@@ -160,37 +160,36 @@ def export_onnx(
         max_batch = batch_size
 
     # ── ONNX export strategy ──────────────────────────────────────────────
-    # PyTorch 2.6 uses torch.export (dynamo) by default in torch.onnx.export.
+    # Problem history:
+    #   1. CUDA + dynamo=True (default) → UnsupportedOperatorException:
+    #      aten.cudnn_grid_sampler (CUDA grid_sample can't be lowered by dynamo)
+    #   2. CPU + ScriptModule + dynamo=True → ValueError: ScriptModule not supported
+    #   3. CPU + plain module + dynamo=True + dynamic_shapes →
+    #      TRT ONNX parser fails to import initializers (dynamo packs weights
+    #      in formats TRT < 10 can't parse, e.g. non-standard dtype metadata)
     #
-    # Two earlier attempts both failed:
-    #   1. CUDA + dynamo  → UnsupportedOperatorException: cudnn_grid_sampler
-    #      (CUDA's F.grid_sample dispatches to the cuDNN kernel)
-    #   2. CPU + ScriptModule + dynamo=False → ValueError: ScriptModule not supported
-    #
-    # Correct approach:
-    #   • CPU execution  – F.grid_sample dispatches to aten.grid_sampler
-    #     (not cudnn_grid_sampler), which dynamo can lower to ONNX.
-    #   • dynamo=True (default) + torch.export.Dim for dynamic_shapes.
-    #     dynamic_axes is the legacy-path parameter; dynamic_shapes is the
-    #     dynamo-path parameter – they are mutually exclusive.
+    # Correct approach: dynamo=False + plain nn.Module + CPU
+    #   • dynamo=False: legacy TorchScript-trace path – initializers stored as
+    #     plain float32 ONNX tensors, always parseable by TRT
+    #   • plain nn.Module (not pre-traced): ScriptModule rejection only happens
+    #     when we pass a jit.trace result to the dynamo path
+    #   • CPU: F.grid_sample → aten.grid_sampler (ONNX-compatible) instead of
+    #     aten.cudnn_grid_sampler
+    #   • dynamic_axes: the correct dynamic-batch parameter for the legacy path
+    #     (dynamic_shapes is the dynamo-path parameter; they are mutually exclusive)
     orig_dev = next(model.parameters()).device
     try:
         wrapper = _RaftExportWrapper(model.cpu(), fixed_iters).eval()
         dummy = torch.zeros(batch_size, 3, input_h, input_w, dtype=torch.float32)
 
-        try:
-            from torch.export import Dim as ExportDim
-            batch_dim = ExportDim("batch", min=1, max=max_batch)
-            dynamic_shapes = {
-                "image1": {0: batch_dim},
-                "image2": {0: batch_dim},
-            }
-        except ImportError:
-            # PyTorch < 2.2 fallback – use legacy dynamic_axes instead.
-            dynamic_shapes = None
+        dynamic_axes = {
+            "image1": {0: "batch"},
+            "image2": {0: "batch"},
+            "flow":   {0: "batch"},
+        }
 
         logger.info(
-            "Exporting ONNX (dynamo, CPU) → %s  "
+            "Exporting ONNX (legacy TorchScript, CPU) → %s  "
             "(opset=%d, H=%d, W=%d, iters=%d, batch=%d, max_batch=%d)",
             onnx_path, opset, input_h, input_w, fixed_iters, batch_size, max_batch,
         )
@@ -198,23 +197,18 @@ def export_onnx(
             f"[INFO] Exporting ONNX (iters={fixed_iters}, "
             f"H={input_h}, W={input_w}, max_batch={max_batch}) → {onnx_path}"
         )
-        export_kwargs = dict(
-            input_names=["image1", "image2"],
-            output_names=["flow"],
-            opset_version=opset,
-            do_constant_folding=True,
-        )
-        if dynamic_shapes is not None:
-            export_kwargs["dynamic_shapes"] = dynamic_shapes
-        else:
-            export_kwargs["dynamic_axes"] = {
-                "image1": {0: "batch"},
-                "image2": {0: "batch"},
-                "flow":   {0: "batch"},
-            }
-
         with torch.no_grad():
-            torch.onnx.export(wrapper, (dummy, dummy), onnx_path, **export_kwargs)
+            torch.onnx.export(
+                wrapper,
+                (dummy, dummy),
+                onnx_path,
+                input_names=["image1", "image2"],
+                output_names=["flow"],
+                dynamic_axes=dynamic_axes,
+                opset_version=opset,
+                do_constant_folding=True,
+                dynamo=False,   # legacy path: plain float32 initializers, TRT-compatible
+            )
     finally:
         model.to(orig_dev)
 
