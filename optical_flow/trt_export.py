@@ -200,6 +200,7 @@ def export_onnx(
             input_names=["image1", "image2"],
             output_names=["flow"],
             dynamic_axes=dynamic_axes,
+            dynamic_shapes=True,
             opset_version=opset,
             do_constant_folding=True,
         )
