@@ -51,6 +51,12 @@ Full argument reference
   --scale         Spatial scale exponent                                    (default: from config)
   --output_subdir Subdirectory name inside each clip for flow files         (default: optical_flow)
   --batch_size    Number of frame pairs to process in one forward pass      (default: 1)
+  --flow_fps      Target optical-flow frame rate (default: same as video)
+  --video_fps     Source video frame rate                                   (default: 25)
+  --use_trt       Convert model to TensorRT before processing
+  --trt_engine    Path to TRT engine file (built/loaded automatically)
+  --trt_fp16      Use FP16 precision when building the TRT engine
+  --trt_workspace TRT builder workspace in GiB                             (default: 4)
   --no_skip       Recompute even if output files already exist
 """
 
@@ -87,6 +93,40 @@ _DEFAULT_FLOW_SUBDIR = "optical_flow"
 _FRAME_PATTERN = re.compile(r"^frame(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
 _DEFAULT_BATCH_SIZE = 1
 _DEFAULT_VIDEO_FPS = 25.0
+_DEFAULT_TRT_WORKSPACE_GB = 4
+
+
+def _detect_trt_input_size(frame_dir: str, splits: list, scale: int) -> tuple:
+    """Read the first available frame and return the TRT input (H, W) after
+    applying *scale* and padding both dims to the nearest multiple of 8.
+
+    Returns ``(h_padded, w_padded)`` for use in :func:`build_sea_raft_engine`.
+    """
+    for split in splits:
+        split_dir = os.path.join(frame_dir, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for entry in sorted(os.listdir(split_dir)):
+            clip_dir = os.path.join(split_dir, entry)
+            if not os.path.isdir(clip_dir):
+                continue
+            for fname in sorted(os.listdir(clip_dir)):
+                if _FRAME_PATTERN.match(fname):
+                    img = cv2.imread(os.path.join(clip_dir, fname))
+                    if img is not None:
+                        h, w = img.shape[:2]
+                        if scale != 0:
+                            factor = 2.0 ** scale  # 0.5 for scale=-1
+                            h = int(round(h * factor))
+                            w = int(round(w * factor))
+                        # Pad to multiple of 8
+                        h_pad = ((h // 8) + (1 if h % 8 else 0)) * 8
+                        w_pad = ((w // 8) + (1 if w % 8 else 0)) * 8
+                        return h_pad, w_pad
+    raise RuntimeError(
+        "Cannot detect input size: no readable frames found in "
+        f"'{frame_dir}' for splits {splits}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +231,10 @@ def precompute_optical_flow(
     batch_size: int = _DEFAULT_BATCH_SIZE,
     flow_fps: float = None,
     video_fps: float = _DEFAULT_VIDEO_FPS,
+    use_trt: bool = False,
+    trt_engine_path: str = None,
+    trt_fp16: bool = True,
+    trt_workspace_gb: int = _DEFAULT_TRT_WORKSPACE_GB,
 ) -> None:
     """Precompute SEA-RAFT optical flow for all clips in a dataset split.
 
@@ -246,6 +290,18 @@ def precompute_optical_flow(
             batched forward pass.  Values greater than 1 improve GPU
             utilisation at the cost of proportionally more VRAM.
             Defaults to ``1`` (original single-pair behaviour).
+        use_trt:
+            When ``True``, convert the loaded PyTorch model to a TensorRT
+            engine before processing.  If *trt_engine_path* is provided and
+            the file exists it is loaded directly (no build step).
+        trt_engine_path:
+            Path to save/load the serialised TRT ``.engine`` file.  When
+            ``None`` a name is derived automatically from the sea_raft_dir,
+            input resolution, and FP16 flag.
+        trt_fp16:
+            Build the TRT engine with FP16 precision (default ``True``).
+        trt_workspace_gb:
+            TRT builder workspace in GiB (default 4).
     """
     # ── device ────────────────────────────────────────────────────────────
     if device is None:
@@ -271,6 +327,54 @@ def precompute_optical_flow(
         model_path=model_path,
         device=device,
     )
+
+    # ── optional TensorRT conversion ──────────────────────────────────────
+    if use_trt:
+        if device.type != "cuda":
+            print("[WARN] TensorRT requires CUDA; --use_trt ignored on CPU.")
+        else:
+            from trt_export import SeaRaftTRTEngine, build_sea_raft_engine  # noqa: E402
+
+            # Derive engine path automatically if not given
+            if trt_engine_path is None:
+                _scale_val = getattr(args_ns, "scale", -1)
+                _prec = "fp16" if trt_fp16 else "fp32"
+                trt_engine_path = os.path.join(
+                    sea_raft_dir,
+                    f"sea_raft_{_prec}_iters{args_ns.iters}.engine",
+                )
+
+            if not os.path.isfile(trt_engine_path):
+                # Need to enumerate splits first to find a sample frame
+                _splits_for_probe = splits
+                if _splits_for_probe is None:
+                    _splits_for_probe = sorted(
+                        d for d in os.listdir(frame_dir)
+                        if os.path.isdir(os.path.join(frame_dir, d))
+                    )
+                _scale_val = getattr(args_ns, "scale", -1)
+                trt_h, trt_w = _detect_trt_input_size(
+                    frame_dir, _splits_for_probe, _scale_val
+                )
+                print(
+                    f"[INFO] TRT engine not found at {trt_engine_path}\n"
+                    f"[INFO] Building engine: H={trt_h}, W={trt_w}, "
+                    f"max_batch={batch_size}, fp16={trt_fp16}"
+                )
+                build_sea_raft_engine(
+                    model, args_ns,
+                    engine_path=trt_engine_path,
+                    input_h=trt_h,
+                    input_w=trt_w,
+                    max_batch=batch_size,
+                    fp16=trt_fp16,
+                    workspace_gb=trt_workspace_gb,
+                )
+            else:
+                print(f"[INFO] Loading existing TRT engine: {trt_engine_path}")
+
+            model = SeaRaftTRTEngine(trt_engine_path, device=device)
+            print("[INFO] Switched to TRT engine for inference.")
 
     # ── enumerate splits ──────────────────────────────────────────────────
     if splits is None:
@@ -455,6 +559,27 @@ def _parse_args() -> argparse.Namespace:
              "None (default) stores flow for every frame.",
     )
     parser.add_argument(
+        "--use_trt", action="store_true",
+        help="Convert the model to a TensorRT engine before processing (CUDA only)",
+    )
+    parser.add_argument(
+        "--trt_engine", default=None, metavar="PATH",
+        help="Path to the TRT .engine file (auto-named inside --sea_raft_dir when omitted)",
+    )
+    parser.add_argument(
+        "--trt_fp16", action="store_true", default=True,
+        help="Build the TRT engine with FP16 precision (default: True)",
+    )
+    parser.add_argument(
+        "--trt_no_fp16", dest="trt_fp16", action="store_false",
+        help="Disable FP16 and build a FP32 TRT engine instead",
+    )
+    parser.add_argument(
+        "--trt_workspace", type=int, default=_DEFAULT_TRT_WORKSPACE_GB,
+        metavar="GB",
+        help="TRT builder workspace in GiB",
+    )
+    parser.add_argument(
         "--no_skip", action="store_true",
         help="Recompute flow even if output files already exist",
     )
@@ -481,6 +606,10 @@ def main() -> None:
         batch_size=args.batch_size,
         flow_fps=args.flow_fps,
         video_fps=args.video_fps,
+        use_trt=args.use_trt,
+        trt_engine_path=args.trt_engine,
+        trt_fp16=args.trt_fp16,
+        trt_workspace_gb=args.trt_workspace,
     )
 
 
