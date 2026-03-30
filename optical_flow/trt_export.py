@@ -131,6 +131,7 @@ def export_onnx(
     input_h: int,
     input_w: int,
     batch_size: int = 1,
+    max_batch: int = None,
     opset: int = 17,
 ) -> None:
     """Export SEA-RAFT to ONNX with fixed spatial dimensions and dynamic batch.
@@ -144,9 +145,9 @@ def export_onnx(
         onnx_path:  Destination ``.onnx`` file path.
         input_h:    Model input height, divisible by 8.
         input_w:    Model input width,  divisible by 8.
-        batch_size: Representative batch size used to trace the model
-                    (the exported graph has a dynamic batch axis so any
-                    batch size up to *max_batch* in the TRT profile works).
+        batch_size: Representative batch size used to trace the model.
+        max_batch:  Upper bound for the dynamic batch axis.  Defaults to
+                    *batch_size*.
         opset:      ONNX opset version.  17+ is recommended.
     """
     if input_h % 8 or input_w % 8:
@@ -155,57 +156,66 @@ def export_onnx(
         )
 
     fixed_iters = int(getattr(args_ns, "iters", 4))
+    if max_batch is None:
+        max_batch = batch_size
 
-    # ── Export on CPU ─────────────────────────────────────────────────────
-    # PyTorch >= 2.6 uses torch.export (dynamo) by default inside
-    # torch.onnx.export, which does not support aten.cudnn_grid_sampler
-    # (the CUDA implementation of F.grid_sample).  Moving the model to CPU
-    # switches grid_sample to aten.grid_sampler, which is fully supported.
+    # ── ONNX export strategy ──────────────────────────────────────────────
+    # PyTorch 2.6 uses torch.export (dynamo) by default in torch.onnx.export.
     #
-    # Passing a torch.jit.ScriptModule (obtained via torch.jit.trace) to
-    # torch.onnx.export forces the legacy TorchScript export path in all
-    # PyTorch versions, bypassing the dynamo exporter entirely.
+    # Two earlier attempts both failed:
+    #   1. CUDA + dynamo  → UnsupportedOperatorException: cudnn_grid_sampler
+    #      (CUDA's F.grid_sample dispatches to the cuDNN kernel)
+    #   2. CPU + ScriptModule + dynamo=False → ValueError: ScriptModule not supported
+    #
+    # Correct approach:
+    #   • CPU execution  – F.grid_sample dispatches to aten.grid_sampler
+    #     (not cudnn_grid_sampler), which dynamo can lower to ONNX.
+    #   • dynamo=True (default) + torch.export.Dim for dynamic_shapes.
+    #     dynamic_axes is the legacy-path parameter; dynamic_shapes is the
+    #     dynamo-path parameter – they are mutually exclusive.
     orig_dev = next(model.parameters()).device
     try:
         wrapper = _RaftExportWrapper(model.cpu(), fixed_iters).eval()
         dummy = torch.zeros(batch_size, 3, input_h, input_w, dtype=torch.float32)
 
+        try:
+            from torch.export import Dim as ExportDim
+            batch_dim = ExportDim("batch", min=1, max=max_batch)
+            dynamic_shapes = {
+                "image1": {0: batch_dim},
+                "image2": {0: batch_dim},
+            }
+        except ImportError:
+            # PyTorch < 2.2 fallback – use legacy dynamic_axes instead.
+            dynamic_shapes = None
+
         logger.info(
-            "Tracing model on CPU for ONNX export "
-            "(H=%d, W=%d, iters=%d, batch=%d) …",
-            input_h, input_w, fixed_iters, batch_size,
+            "Exporting ONNX (dynamo, CPU) → %s  "
+            "(opset=%d, H=%d, W=%d, iters=%d, batch=%d, max_batch=%d)",
+            onnx_path, opset, input_h, input_w, fixed_iters, batch_size, max_batch,
         )
         print(
-            f"[INFO] Tracing SEA-RAFT on CPU "
-            f"(iters={fixed_iters}, H={input_h}, W={input_w}) …"
+            f"[INFO] Exporting ONNX (iters={fixed_iters}, "
+            f"H={input_h}, W={input_w}, max_batch={max_batch}) → {onnx_path}"
         )
-        with torch.no_grad():
-            # strict=False: RAFT's forward pass contains dict/list operations
-            # that are not representable as pure TorchScript but are fine to
-            # trace (they are data-independent control flow over a fixed
-            # iteration count).
-            traced = torch.jit.trace(wrapper, (dummy, dummy), strict=False)
-
-        dynamic_axes = {
-            "image1": {0: "batch"},
-            "image2": {0: "batch"},
-            "flow":   {0: "batch"},
-        }
-
-        print(f"[INFO] Exporting ONNX → {onnx_path}")
-        torch.onnx.export(
-            traced,
-            (dummy, dummy),
-            onnx_path,
+        export_kwargs = dict(
             input_names=["image1", "image2"],
             output_names=["flow"],
-            dynamic_axes=dynamic_axes,
-            dynamic_shapes=True,
             opset_version=opset,
             do_constant_folding=True,
         )
+        if dynamic_shapes is not None:
+            export_kwargs["dynamic_shapes"] = dynamic_shapes
+        else:
+            export_kwargs["dynamic_axes"] = {
+                "image1": {0: "batch"},
+                "image2": {0: "batch"},
+                "flow":   {0: "batch"},
+            }
+
+        with torch.no_grad():
+            torch.onnx.export(wrapper, (dummy, dummy), onnx_path, **export_kwargs)
     finally:
-        # Restore model to its original device regardless of success/failure.
         model.to(orig_dev)
 
     print(f"[INFO] ONNX export complete: {onnx_path}")
@@ -372,7 +382,7 @@ def build_sea_raft_engine(
         export_onnx(
             model, args_ns, onnx_path,
             input_h=input_h, input_w=input_w,
-            batch_size=max_batch, opset=opset,
+            batch_size=max_batch, max_batch=max_batch, opset=opset,
         )
         build_engine(
             onnx_path, engine_path,
