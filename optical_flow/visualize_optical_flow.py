@@ -266,7 +266,16 @@ def visualise_samples(
             print(f"[WARN] Cannot read image: {frame_path}, skipping.")
             continue
 
-        flow_np = np.load(flow_path)  # [H, W, 2] float32
+        flow_np = np.load(flow_path).astype(np.float32)  # [H, W, 2] – may be float16 half-res
+        # If stored at half resolution, scale the values up to full-pixel units
+        # before colourisation so magnitudes are visually meaningful.
+        fh, fw = flow_np.shape[:2]
+        frm_h, frm_w = frame_bgr.shape[:2]
+        if fh != frm_h or fw != frm_w:
+            import cv2 as _cv2
+            scale_factor = frm_h / fh
+            flow_np = _cv2.resize(flow_np, (frm_w, frm_h),
+                                  interpolation=_cv2.INTER_LINEAR) * scale_factor
         flow_bgr = _flow_to_bgr(flow_np, sea_raft_dir)
 
         canvas = _make_side_by_side(frame_bgr, flow_bgr, frame_num)

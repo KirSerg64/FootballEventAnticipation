@@ -337,7 +337,7 @@ def build_engine(
 
     with open(engine_path, "wb") as f:
         f.write(serialized)
-    size_mb = len(serialized) / 1e6
+    size_mb = serialized.size / 1e6
     print(f"[INFO] TRT engine saved → {engine_path}  ({size_mb:.1f} MB)")
 
 
@@ -462,15 +462,6 @@ class SeaRaftTRTEngine:
             f"(inputs={self._input_names}, outputs={self._output_names})"
         )
 
-    # ── helpers ──────────────────────────────────────────────────────────
-
-    def _output_shape(self, name: str, batch: int) -> tuple:
-        """Query the TRT engine for the output shape given a batch size."""
-        # Output shape is determined by the context after set_input_shape.
-        shape = self._context.get_tensor_shape(name)
-        # shape[0] is the batch dim (may be -1 for dynamic); replace it.
-        return (batch,) + tuple(shape[1:])
-
     # ── forward ──────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -503,8 +494,11 @@ class SeaRaftTRTEngine:
         self._context.set_input_shape("image2", (B, 3, H_pad, W_pad))
 
         # ── allocate output buffer ─────────────────────────────────────────
-        out_shape = self._output_shape("flow", B)
-        flow_buf = torch.empty(*out_shape, dtype=torch.float32, device=self.device)
+        # NOTE: get_tensor_shape() for outputs is only valid after
+        # execute_async_v3, not after set_input_shape.  Compute the shape
+        # directly: RAFT outputs flow at the same spatial size as the input,
+        # 2 channels (dx, dy).
+        flow_buf = torch.empty(B, 2, H_pad, W_pad, dtype=torch.float32, device=self.device)
 
         # ── bind tensor addresses ─────────────────────────────────────────
         self._context.set_tensor_address("image1", img1_pad.data_ptr())
