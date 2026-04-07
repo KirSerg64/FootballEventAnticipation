@@ -453,6 +453,20 @@ class SeaRaftTRTEngine:
             nm for nm in self._io_names
             if self._engine.get_tensor_mode(nm) == trt.TensorIOMode.OUTPUT
         ]
+
+        # Cache output dtype so __call__ allocates a matching buffer.
+        # TRT compiles outputs as HALF when FP16 mode is active; writing FP16
+        # bytes into a float32 buffer causes every two FP16 values to be
+        # misread as one float32 — exactly the "batch mixing" symptom.
+        _trt_to_torch = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF:  torch.float16,
+            trt.DataType.INT32: torch.int32,
+            trt.DataType.INT8:  torch.int8,
+        }
+        self._out_dtype = _trt_to_torch.get(
+            self._engine.get_tensor_dtype("flow"), torch.float32
+        )
         logger.info(
             "TRT engine loaded from %s  |  inputs: %s  outputs: %s",
             engine_path, self._input_names, self._output_names,
@@ -494,11 +508,10 @@ class SeaRaftTRTEngine:
         self._context.set_input_shape("image2", (B, 3, H_pad, W_pad))
 
         # ── allocate output buffer ─────────────────────────────────────────
-        # NOTE: get_tensor_shape() for outputs is only valid after
-        # execute_async_v3, not after set_input_shape.  Compute the shape
-        # directly: RAFT outputs flow at the same spatial size as the input,
-        # 2 channels (dx, dy).
-        flow_buf = torch.empty(B, 2, H_pad, W_pad, dtype=torch.float32, device=self.device)
+        # Allocate with the engine's actual output dtype (may be float16 when
+        # the engine was built with FP16).  Dtype mismatch here causes TRT to
+        # write N-byte values into a 2N-byte buffer, corrupting all batch items.
+        flow_buf = torch.empty(B, 2, H_pad, W_pad, dtype=self._out_dtype, device=self.device)
 
         # ── bind tensor addresses ─────────────────────────────────────────
         self._context.set_tensor_address("image1", img1_pad.data_ptr())
@@ -509,7 +522,7 @@ class SeaRaftTRTEngine:
         self._context.execute_async_v3(self._stream.cuda_stream)
         torch.cuda.current_stream(self.device).wait_stream(self._stream)
 
-        # ── remove padding ────────────────────────────────────────────────
-        flow = _unpad(flow_buf, pad_spec)
+        # ── remove padding and normalise dtype to float32 ─────────────────
+        flow = _unpad(flow_buf.float(), pad_spec)
 
         return {"flow": [flow], "info": [], "nf": None}

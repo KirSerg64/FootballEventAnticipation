@@ -207,7 +207,7 @@ def _compute_flow_batch(
     flow_final = output['flow'][-1]   # [B, 2, H_s, W_s]
 
     flow_final = output['flow'][-1]
-    info_final = output['info'][-1]
+    # info_final = output['info'][-1]
 
     if scale != 0:
         down = 0.5 ** scale
@@ -216,9 +216,9 @@ def _compute_flow_batch(
         #     * down
         # )
         flow_down = F.interpolate(flow_final, scale_factor=down, mode='bilinear', align_corners=False) * down
-        info_down = F.interpolate(info_final, scale_factor=down, mode='area')
+        # info_down = F.interpolate(info_final, scale_factor=down, mode='area')
     else:
-        flow_down, info_down = flow_final, info_final
+        flow_down = flow_final
 
     # Return at SEA-RAFT native resolution (half-res when scale=-1).
     # Values are in scaled-pixel units; the loader rescales on upsample.
