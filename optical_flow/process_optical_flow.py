@@ -206,6 +206,20 @@ def _compute_flow_batch(
     output = model(t1s, t2s, iters=args_ns.iters, test_mode=True)
     flow_final = output['flow'][-1]   # [B, 2, H_s, W_s]
 
+    flow_final = output['flow'][-1]
+    info_final = output['info'][-1]
+
+    if scale != 0:
+        down = 0.5 ** scale
+        # flow = (
+        #     F.interpolate(flow_final, size=(t1.shape[2], t1.shape[3]), mode="bilinear", align_corners=False)
+        #     * down
+        # )
+        flow_down = F.interpolate(flow_final, scale_factor=down, mode='bilinear', align_corners=False) * down
+        info_down = F.interpolate(info_final, scale_factor=down, mode='area')
+    else:
+        flow_down, info_down = flow_final, info_final
+
     # Return at SEA-RAFT native resolution (half-res when scale=-1).
     # Values are in scaled-pixel units; the loader rescales on upsample.
     # [B, 2, H_s, W_s] → [B, H_s, W_s, 2], stored as float16 to halve disk space.
