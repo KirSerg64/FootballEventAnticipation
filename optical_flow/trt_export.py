@@ -180,7 +180,13 @@ def export_onnx(
     orig_dev = next(model.parameters()).device
     try:
         wrapper = _RaftExportWrapper(model.cpu(), fixed_iters).eval()
-        dummy = torch.zeros(batch_size, 3, input_h, input_w, dtype=torch.float32)
+        # Use a realistic mid-gray dummy (127.5) instead of all-zeros.
+        # RAFT.forward normalizes by 2*(x/255)-1; all-zero inputs produce constant
+        # activation maps that may activate different code paths during TorchScript
+        # tracing (e.g. epsilon guards in correlation / normalisation layers).
+        dummy = torch.full(
+            (batch_size, 3, input_h, input_w), 127.5, dtype=torch.float32
+        )
 
         dynamic_axes = {
             "image1": {0: "batch"},
@@ -519,6 +525,12 @@ class SeaRaftTRTEngine:
         self._context.set_tensor_address("flow",   flow_buf.data_ptr())
 
         # ── asynchronous execution ────────────────────────────────────────
+        # img1_pad / img2_pad were prepared on the default CUDA stream (F.pad,
+        # .to(), .contiguous()).  execute_async_v3 runs on self._stream.  Without
+        # an explicit dependency, both streams run concurrently and TRT may read
+        # the input buffers before the default stream has finished writing them —
+        # causing garbled / stale flow maps.  Force self._stream to wait first.
+        self._stream.wait_stream(torch.cuda.current_stream(self.device))
         self._context.execute_async_v3(self._stream.cuda_stream)
         torch.cuda.current_stream(self.device).wait_stream(self._stream)
 

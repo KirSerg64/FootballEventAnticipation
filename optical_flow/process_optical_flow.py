@@ -223,7 +223,7 @@ def _compute_flow_batch(
     # Return at SEA-RAFT native resolution (half-res when scale=-1).
     # Values are in scaled-pixel units; the loader rescales on upsample.
     # [B, 2, H_s, W_s] → [B, H_s, W_s, 2], stored as float16 to halve disk space.
-    return flow_final.permute(0, 2, 3, 1).cpu().to(torch.float16).numpy()
+    return flow_final.permute(0, 2, 3, 1).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
