@@ -134,7 +134,8 @@ def main():
     model = FUTR(n_class, args.hidden_dim, device=device, args=args, src_pad_idx=pad_idx,
                             n_query=args.n_query, n_head=args.n_head,
                             num_encoder_layers=args.n_encoder_layer, num_decoder_layers=args.n_decoder_layer,
-                            src_attn_mask=src_attn_mask, tgt_attn_mask=tgt_attn_mask).to(device)
+                            src_attn_mask=src_attn_mask, tgt_attn_mask=tgt_attn_mask,
+                            use_optical_flow=args.use_optical_flow).to(device)
 
     model_save_path = os.path.join(args.save_dir + 'model/transformer')
     results_save_path = os.path.join(args.save_dir + '/results/transformer')

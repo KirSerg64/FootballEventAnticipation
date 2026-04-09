@@ -156,9 +156,14 @@ class ActionSpotDataset(Dataset):
             clip_end   = self._clip_idx_range[1] if self._clip_idx_range is not None else num_clips
             for clip_idx in range(clip_start, clip_end):
                 labels_file = labels_files[clip_idx]['annotations']['observation'] + labels_files[clip_idx]['annotations']['anticipation']
+                # Derive clip folder from the 'path' field in Labels-ball.json
+                # (e.g. "clip_42/720p.mp4" -> "clip_42").  Using the path field
+                # instead of f"clip_{clip_idx+1}" keeps frame paths and labels
+                # aligned even when clips are a non-sequential sampled subset.
+                clip_folder = os.path.dirname(labels_files[clip_idx]['path'])
                 for base_idx in range(-self._pad_len * self._stride, max(0, video_len - 1 + (2 * self._pad_len - self._clip_len) * self._stride), self._overlap):
 
-                    frames_paths = self._frame_reader.load_paths(video['video'] + f"/clip_{clip_idx+1}", base_idx, base_idx + self._clip_len * self._stride, stride=self._stride)
+                    frames_paths = self._frame_reader.load_paths(video['video'] + f"/{clip_folder}", base_idx, base_idx + self._clip_len * self._stride, stride=self._stride)
 
                     labels = []
                     if self._radi_displacement >= 0:

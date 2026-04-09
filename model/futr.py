@@ -13,6 +13,7 @@ from model.extras.position import PositionalEncoding
 import timm
 from model.T_Deed_Modules.modules import EDSGPMIXERLayers
 from model.T_Deed_Modules.shift import make_temporal_shift
+from model.flow_fusion import FlowFusion
 
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
@@ -34,6 +35,9 @@ class FUTR(nn.Module):
         self.tgt_attn_mask = tgt_attn_mask
         self.jointtrain_available = args.jointtrain is not None
         self.use_optical_flow = use_optical_flow
+        # getattr with defaults keeps backward compat when loading old checkpoints
+        self.flow_norm = getattr(args, 'flow_norm', 'magnitude')
+        self.flow_norm_scale = float(getattr(args, 'flow_norm_scale', 1.0))
         if self.feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
             self.features = timm.create_model({
                 'rny002': 'regnety_002',
@@ -50,9 +54,7 @@ class FUTR(nn.Module):
             raise NotImplementedError(args.feature_arch)
         
         # add optical flow features if specified
-        if self.use_optical_flow:
-            self.input_dim += 2  # Assuming optical flow has 2 channels (horizontal and vertical)
-
+        self.flow_fusion = None          
 
         # Add Temporal Shift Modules
         # NOTE: NEED TO CHANGE 2ND ARGUMENT FOR CHEATING DATASET
@@ -160,15 +162,21 @@ class FUTR(nn.Module):
         src_mask = self.src_attn_mask
         tgt_mask = self.tgt_attn_mask
 
-        #concat optical flow features if specified
-        if self.use_optical_flow and src_flow is not None:
-            src = torch.cat((src, src_flow), dim=2)  # Assuming src is [B, S, C, H, W] and src_flow is [B, S, 2, H, W]
-
         B, S, C, H, W = src.size()
         src = src/255.0         # Normalize
         if mode == "train":
             src = self.augment(src) #augmentation per-batch
         src = self.standarize(src) #standarization imagenet stats
+
+        #fuse optical flow features if specified
+        if self.use_optical_flow and src_flow is not None:
+            if self.flow_fusion is None:
+                self.flow_fusion = FlowFusion(
+                    input_shape=(1, 2, H, W),  # Placeholder shape, will be updated in forward
+                    flow_dim=2,
+                    hidden_dim=32)            
+            src = self.flow_fusion(src.view(-1, C, H, W), src_flow.view(-1, 2, H, W)).reshape(B, S, self.input_dim, H, W)
+
         src = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
 
         if self.temp_arch == 'ed_sgp_mixer':

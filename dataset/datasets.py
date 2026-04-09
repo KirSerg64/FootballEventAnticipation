@@ -41,6 +41,9 @@ def get_datasets(args, label_pad_idx, n_class):
         'anticipate_background': args.anticipate_background, 'use_actionness': args.actionness,
         'use_anchors': args.use_anchors, 'cheating_dataset': args.cheating_dataset,
         'cheating_range': args.cheating_range,
+        'use_optical_flow': args.use_optical_flow,
+        'flow_subdir': args.flow_subdir,
+        'flow_fps': args.flow_fps,
     }
 
     # -----------------------------------------------------------------------
