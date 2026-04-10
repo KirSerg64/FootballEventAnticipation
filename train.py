@@ -247,7 +247,11 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
                 #print(j)
                 step_log_dict = {"val/step": epoch*len(val_loader) + j+1}
                 postfix_kwargs = {"loss": 0}
-                features, past_label, trans_off_future, trans_future_target, target_actionness = data
+                if model.module.use_optical_flow:
+                    features, past_label, trans_off_future, trans_future_target, target_actionness, observed_flow = data
+                else:
+                    features, past_label, trans_off_future, trans_future_target, target_actionness = data
+                    observed_flow = None
                 features = features.to(device) #[B, S, C]
                 past_label = past_label.to(device) #[B, S]
                 trans_off_future = trans_off_future.to(device)
@@ -257,7 +261,7 @@ def train(args, model, train_loader, val_loader, optimizer, scheduler, criterion
 
                 target_off = trans_off_future*trans_off_future_mask # Mask off padding in ground truth offsets. Not relevant when using background
                 target = trans_future_target
-                inputs = features
+                inputs = (features, observed_flow) if model.module.use_optical_flow else features
 
                 outputs = model(inputs, mode="validation")
                 losses = 0
