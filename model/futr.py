@@ -35,9 +35,6 @@ class FUTR(nn.Module):
         self.tgt_attn_mask = tgt_attn_mask
         self.jointtrain_available = args.jointtrain is not None
         self.use_optical_flow = use_optical_flow
-        # getattr with defaults keeps backward compat when loading old checkpoints
-        self.flow_norm = getattr(args, 'flow_norm', 'magnitude')
-        self.flow_norm_scale = float(getattr(args, 'flow_norm_scale', 1.0))
         if self.feature_arch.startswith(('rny002', 'rny004', 'rny006', 'rny008')):
             self.features = timm.create_model({
                 'rny002': 'regnety_002',
@@ -54,7 +51,15 @@ class FUTR(nn.Module):
             raise NotImplementedError(args.feature_arch)
         
         # add optical flow features if specified
-        self.flow_fusion = None          
+        # Constructed here in __init__ so weights are tracked, saved, and moved
+        # to the correct device automatically. feat_dim is already known above.
+        if self.use_optical_flow:
+            self.flow_fusion = FlowFusion(
+                input_dim=feat_dim,
+                flow_dim=2,
+                hidden_dim=32)
+        else:
+            self.flow_fusion = None
 
         # Add Temporal Shift Modules
         # NOTE: NEED TO CHANGE 2ND ARGUMENT FOR CHEATING DATASET
@@ -168,16 +173,17 @@ class FUTR(nn.Module):
             src = self.augment(src) #augmentation per-batch
         src = self.standarize(src) #standarization imagenet stats
 
-        #fuse optical flow features if specified
-        if self.use_optical_flow and src_flow is not None:
-            if self.flow_fusion is None:
-                self.flow_fusion = FlowFusion(
-                    input_shape=(1, 2, H, W),  # Placeholder shape, will be updated in forward
-                    flow_dim=2,
-                    hidden_dim=32)            
-            src = self.flow_fusion(src.view(-1, C, H, W), src_flow.view(-1, 2, H, W)).reshape(B, S, self.input_dim, H, W)
+        # Run backbone on RGB-only input, then fuse with flow at feature-map level.
+        spatial_feat = self.features.forward_features(src.view(-1, C, H, W))  # [B*S, feat_dim, h, w]
 
-        src = self.features(src.view(-1, C, H, W)).reshape(B, S, self.input_dim)
+        if self.use_optical_flow and src_flow is not None:
+            flow = src_flow.view(-1, 2, src_flow.shape[-2], src_flow.shape[-1])  # [B*S, 2, Hf, Wf]
+            fused = self.flow_fusion(spatial_feat, flow)   # [B*S, feat_dim, h, w]
+        else:
+            fused = spatial_feat
+
+        # Global average pool to collapse spatial dims -> [B*S, feat_dim]
+        src = fused.mean(dim=[-2, -1]).reshape(B, S, self.input_dim)
 
         if self.temp_arch == 'ed_sgp_mixer':
             src = src + self.temp_enc.expand(B, -1, -1)

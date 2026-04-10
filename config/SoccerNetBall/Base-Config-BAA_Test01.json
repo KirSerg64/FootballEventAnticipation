@@ -43,7 +43,5 @@
     "train_local_split": null,
     "use_optical_flow": false,
     "flow_subdir": "optical_flow",
-    "flow_fps": null,
-    "flow_norm": "magnitude",
-    "flow_norm_scale": 20.0
+    "flow_fps": null
 }

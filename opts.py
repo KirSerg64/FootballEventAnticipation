@@ -115,14 +115,5 @@ def update_args(args, config):
     args.use_optical_flow = config.get("use_optical_flow", False)    # Load precomputed optical flow alongside RGB frames
     args.flow_subdir = config.get("flow_subdir", "optical_flow")     # Sub-directory inside each clip folder that holds .npy flow files
     args.flow_fps = config.get("flow_fps", None)                      # Target flow FPS used during precomputation; None = same as video
-    # How to normalise flow vectors before spatial pooling and feature concat.
-    # "none"      – raw pixel displacements (not recommended; large spread).
-    # "minmax"    – per-frame linear rescale to [-1, 1].
-    # "magnitude" – divide by max L2 magnitude per frame; still regions → 0,
-    #               moving regions → unit-length vectors (recommended).
-    # "tanh"      – tanh(flow / flow_norm_scale); soft saturation at large
-    #               displacements while preserving sign / direction.
-    args.flow_norm = config.get("flow_norm", "magnitude")
-    args.flow_norm_scale = config.get("flow_norm_scale", 20.0)        # Scale divisor used only by the "tanh" mode
 
     return args

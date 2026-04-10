@@ -4,11 +4,15 @@ import torch.nn.functional as F
 
 
 class FlowFusion(nn.Module):
-    def __init__(self, input_shape, flow_dim=2, hidden_dim=32):
+    def __init__(self, input_dim, flow_dim=2, hidden_dim=32):
         super().__init__()
-        bs, input_dim, h, w = input_shape
         self.flow_dim = flow_dim
-        self.flow_norm = nn.LayerNorm((flow_dim, h, w))
+        # InstanceNorm2d normalises each [H, W] map independently per channel
+        # per sample, so frame i never influences the normalisation of frame j.
+        # This is correct because the B*S leading dimension mixes time steps,
+        # and motion statistics vary significantly across frames.
+        # affine=True adds learnable scale/shift so the network can adjust range.
+        self.flow_norm = nn.InstanceNorm2d(flow_dim, affine=True)
         self.conv_1 = nn.Conv2d(input_dim + flow_dim, hidden_dim, kernel_size=3, padding=1)
         self.relu = nn.ReLU(inplace=True)
         self.conv_2 = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
