@@ -407,8 +407,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     # Improvement G: track lifecycle
     parser.add_argument(
-        "--max_age", type=int, default=30,
-        help="Max frames a track survives without a detection (default: 30)",
+        "--max_age", type=int, default=90,
+        help="Max frames a track survives without a detection (default: 90 ≈ 3 s at 30 fps)",
     )
     # Improvement D: camera-motion compensation
     parser.add_argument(
@@ -431,6 +431,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "handles zoom and rotation in addition to pan.  Falls back to "
             "'median' when homography is unavailable (first frame or "
             "--no_homography)."
+        ),
+    )
+    # Appearance-based Re-ID (recover track IDs after long occlusions)
+    parser.add_argument(
+        "--no_reid", action="store_true",
+        help=(
+            "Disable appearance-based Re-ID.  "
+            "By default, HSV colour histograms are used to re-assign original "
+            "track IDs to players who reappear after an occlusion longer than "
+            "BoT-SORT's track_buffer window."
+        ),
+    )
+    parser.add_argument(
+        "--reid_gallery_ttl", type=int, default=90,
+        help=(
+            "Number of frames to retain a lost-track appearance in the Re-ID gallery "
+            "(default: 90 ≈ 3 s at 30 fps).  After this many frames the entry is pruned."
+        ),
+    )
+    parser.add_argument(
+        "--reid_similarity_threshold", type=float, default=0.85,
+        help=(
+            "Minimum cosine similarity [0, 1] between HSV histograms required to "
+            "re-assign an old track ID (default: 0.85).  Increase to reduce false "
+            "re-identifications; decrease to improve recall."
         ),
     )
     # Improvement F: team colour clustering
@@ -883,6 +908,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             sam_device=args.sam_device,
             ball_det_device=args.ball_det_device or args.det_device,
             sam_bfloat16=args.sam_bfloat16,
+            enable_reid=not args.no_reid,
+            reid_gallery_ttl=args.reid_gallery_ttl,
+            reid_similarity_threshold=args.reid_similarity_threshold,
         )
 
     if args.sam_backend == "sam3":

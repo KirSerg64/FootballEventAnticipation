@@ -10,11 +10,18 @@ Architecture (updated)
    Kalman-filter motion model, globally-optimal Hungarian assignment, and
    configurable track-lifecycle management (``max_age``).
 
-2. **SAM2VideoPredictor** is used as a *mask refiner*.  It is seeded with the
-   initial YOLO bounding boxes on frame 0 and streams per-frame binary masks.
-   These masks are matched to the BoT-SORT tracks via the Hungarian algorithm,
-   so the final output combines SAM2's pixel-accurate mask quality with
-   BoT-SORT's ID stability.
+   ``_track_frame`` returns a ``{track_id: bbox}`` dict of confirmed BoT-SORT
+   tracks.  These are converted directly to a :class:`TrackerState` via
+   ``_tracks_to_state``.  The YOLO-only ``_fallback_detect`` path is used only
+   when BoT-SORT returns no tracks (e.g. scene start before IDs are assigned).
+
+2. **Appearance-based Re-ID** (:class:`AppearanceReIDMatcher`) extends
+   BoT-SORT's internal ``track_buffer`` window with a gallery of HSV colour
+   histograms.  When BoT-SORT issues a new ID for a player who had disappeared
+   for longer than ``max_age`` frames, ``rematch`` compares the new detection's
+   torso histogram against the gallery and re-assigns the original ID if cosine
+   similarity exceeds ``reid_similarity_threshold``.  This ensures consistent
+   IDs through 1–3 second occlusions.
 
 3. **Camera-motion compensation** (ORB + RANSAC homography) is applied in the
    YOLO-only fallback path and during re-detection to warp previous-frame
@@ -68,6 +75,7 @@ from scipy.optimize import linear_sum_assignment
 import torch
 import supervision as sv
 
+from segmentation_tracking.appearance_reid import AppearanceReIDMatcher
 from segmentation_tracking.ball_kalman import BallDCFTracker, BallKalmanFilter, BallCoTrackerTracker
 from segmentation_tracking.sam2_tracker import SAM2Tracker
 
@@ -191,7 +199,9 @@ class SegmentationTracker:
         Tracker algorithm: ``"botsort"`` (default) or ``"bytetrack"``.
     max_age:
         Maximum frames a track survives without a detection (maps to
-        ``track_buffer`` in the tracker YAML).
+        ``track_buffer`` in the tracker YAML).  Default ``90`` (≈ 3 s at
+        30 fps) to survive short occlusions without losing the track ID.
+        The appearance Re-ID module extends recovery further.
     use_homography:
         When *True*, estimate frame-to-frame ORB+RANSAC homography and warp
         previous-frame bboxes before IoU matching in the fallback path to
@@ -238,6 +248,16 @@ class SegmentationTracker:
     ball_cotracker_redetect_interval:
         Number of YOLO-confirmed ball detections between forced CoTracker3
         re-anchors.  Default ``15``.
+    enable_reid:
+        When *True* (default), use :class:`AppearanceReIDMatcher` to recover
+        original track IDs when players reappear after occlusions longer than
+        ``max_age`` frames.
+    reid_gallery_ttl:
+        Number of frames to retain a lost-track's appearance in the Re-ID
+        gallery.  Default ``90`` (≈ 3 s at 30 fps).
+    reid_similarity_threshold:
+        Minimum cosine similarity ``[0, 1]`` for a gallery match to be
+        accepted.  Default ``0.85``.
     """
 
     def __init__(
@@ -250,7 +270,7 @@ class SegmentationTracker:
         iou_threshold: float = 0.3,
         redetect_interval: int = 30,
         tracker: str = "botsort",
-        max_age: int = 30,
+        max_age: int = 90,
         use_homography: bool = True,
         ball_patch_size: int = 32,
         ball_search_radius: int = 60,
@@ -279,6 +299,10 @@ class SegmentationTracker:
         ball_det_device: str | None = None,
         # Cast SAM2 weights to bfloat16 to halve VRAM (~7 GB for large, ~2 GB for base)
         sam_bfloat16: bool = False,
+        # Appearance-based Re-ID after long occlusions
+        enable_reid: bool = True,
+        reid_gallery_ttl: int = 90,
+        reid_similarity_threshold: float = 0.85,
     ) -> None:
         self._sam_config = sam_model_config
         self._sam_checkpoint = sam_model_checkpoint
@@ -325,6 +349,17 @@ class SegmentationTracker:
         self.field_min_overlap = field_min_overlap
         self.field_mask_interval = field_mask_interval
         self._cached_field_mask: np.ndarray | None = None
+
+        # Appearance Re-ID state
+        self._reid_matcher: AppearanceReIDMatcher | None = (
+            AppearanceReIDMatcher(
+                gallery_ttl=reid_gallery_ttl,
+                similarity_threshold=reid_similarity_threshold,
+            )
+            if enable_reid
+            else None
+        )
+        self._reid_prev_track_ids: set[int] = set()
 
         self._sam_tracker = None
         # Path to customised tracker YAML written at init time
@@ -819,6 +854,85 @@ class SegmentationTracker:
 
     # -- SAM2 helpers ---------------------------------------------------------
 
+    # -- BoT-SORT → TrackerState conversion -----------------------------------
+
+    def _tracks_to_state(
+        self,
+        bot_tracks: dict[int, np.ndarray],
+        frame: np.ndarray,
+        seg_result: TrackerState,
+    ) -> TrackerState:
+        """Convert a BoT-SORT track dict into a :class:`TrackerState`.
+
+        Builds an ``sv.Detections`` with rectangle masks (SAM2 is not involved
+        here; SAM2 is used separately in the segmentation-refiner path).
+        The ``tracker_id`` values are the persistent BoT-SORT track IDs.
+
+        Parameters
+        ----------
+        bot_tracks:
+            ``{track_id: bbox_float32}`` mapping returned by :meth:`_track_frame`.
+        frame:
+            Current BGR video frame (used to compute mask shape).
+        seg_result:
+            The :class:`TrackerState` to populate in-place and return.
+        """
+        if not bot_tracks:
+            return seg_result
+
+        all_xyxy: list[np.ndarray] = []
+        all_masks: list[np.ndarray] = []
+        all_tids: list[int] = []
+        for tid, bbox in bot_tracks.items():
+            all_xyxy.append(bbox)
+            all_masks.append(self._rect_mask(bbox, frame.shape).astype(bool))
+            all_tids.append(tid)
+
+        seg_result.tracks = sv.Detections(
+            xyxy=np.array(all_xyxy, dtype=np.float32),
+            mask=np.array(all_masks, dtype=bool),
+            tracker_id=np.array(all_tids, dtype=np.int32),
+        )
+        return seg_result
+
+    @staticmethod
+    def _apply_id_remap(
+        seg_result: TrackerState,
+        remap: dict[int, int],
+    ) -> TrackerState:
+        """Replace new track IDs with recovered gallery IDs in *seg_result*.
+
+        Parameters
+        ----------
+        seg_result:
+            Current frame tracking state.
+        remap:
+            ``{new_id: old_id}`` returned by :meth:`AppearanceReIDMatcher.rematch`.
+
+        Returns
+        -------
+        The same *seg_result* with tracker IDs updated.
+        """
+        if (
+            not remap
+            or seg_result.tracks is None
+            or seg_result.tracks.tracker_id is None
+        ):
+            return seg_result
+
+        new_ids = seg_result.tracks.tracker_id.copy()
+        for i, tid in enumerate(new_ids):
+            old_id = remap.get(int(tid))
+            if old_id is not None:
+                new_ids[i] = old_id
+
+        seg_result.tracks = sv.Detections(
+            xyxy=seg_result.tracks.xyxy,
+            mask=seg_result.tracks.mask,
+            tracker_id=new_ids,
+        )
+        return seg_result
+
     # -- Core processing loop -------------------------------------------------
 
     def _merge_bot_sam_results(
@@ -1097,6 +1211,11 @@ class SegmentationTracker:
         self._ball_tracker.reset()
         self._cached_field_mask = None
 
+        # Reset ReID state for this video
+        if self._reid_matcher is not None:
+            self._reid_matcher.reset()
+        self._reid_prev_track_ids: set[int] = set()
+
         # -- Read first frame -------------------------------------------------
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -1162,17 +1281,27 @@ class SegmentationTracker:
                     for tid, bbox in bot_tracks.items()
                     if self._bbox_on_field(bbox, self._cached_field_mask)
                 }
-            # Merge BoT-SORT IDs, or fall back to YOLO-only
 
-            seg_result = self._fallback_detect(
-                frame, frame_idx, results, seg_result, homography
-            )
+            # Use BoT-SORT tracks when available; fall back to YOLO-only when
+            # BoT-SORT returns nothing (e.g. very first frame before IDs are
+            # assigned, or when YOLO detects nothing).
+            if bot_tracks:
+                seg_result = self._tracks_to_state(bot_tracks, frame, seg_result)
+            else:
+                seg_result = self._fallback_detect(
+                    frame, frame_idx, results, seg_result, homography
+                )
+
             # Re-detection for late-entering players
             if (self.redetect_interval > 0
                 and frame_idx > 0
                 and frame_idx % self.redetect_interval == 0
             ):
                 seg_result = self._redetect_new_players(frame, seg_result, homography)
+
+            # -- Appearance-based Re-ID (recover IDs after long occlusions) ---
+            if self._reid_matcher is not None:
+                seg_result = self._run_reid(seg_result, frame, results)
 
             # Ball correlation tracker (detection-first + MOSSE gap fill)
             seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
@@ -1186,3 +1315,93 @@ class SegmentationTracker:
         cap2.release()
         logger.info("Finished processing %d frames", len(results))
         return results
+
+    # -- Appearance Re-ID helper ----------------------------------------------
+
+    def _run_reid(
+        self,
+        seg_result: TrackerState,
+        frame: np.ndarray,
+        previous_results: list[TrackerState],
+    ) -> TrackerState:
+        """Run one iteration of the appearance Re-ID pipeline.
+
+        Steps
+        -----
+        1. Compute current active track IDs (excluding ball, id == -1).
+        2. Identify *new* IDs (absent last frame) and *lost* IDs (present last
+           frame, absent now).
+        3. Move lost-track appearance histograms into the gallery.
+        4. Attempt to re-assign new IDs using gallery similarity.
+        5. Update active appearance models for all currently-visible tracks.
+        6. Age the gallery, pruning entries that exceed ``gallery_ttl``.
+
+        Parameters
+        ----------
+        seg_result:
+            Current frame tracking result (before ball is appended).
+        frame:
+            Current BGR video frame.
+        previous_results:
+            All previously-processed frames (used to retrieve last bboxes of
+            lost tracks).
+
+        Returns
+        -------
+        Updated *seg_result* with any re-identified track IDs applied.
+        """
+        assert self._reid_matcher is not None
+
+        # Collect current player IDs
+        cur_track_ids: set[int] = set()
+        if seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
+            cur_track_ids = {
+                int(tid)
+                for tid in seg_result.tracks.tracker_id
+                if int(tid) != -1
+            }
+
+        new_ids = [tid for tid in cur_track_ids if tid not in self._reid_prev_track_ids]
+        lost_ids = [tid for tid in self._reid_prev_track_ids if tid not in cur_track_ids]
+
+        # Move lost tracks into gallery (using their last-seen bboxes)
+        if lost_ids and previous_results:
+            prev_state = previous_results[-1]
+            last_bboxes: dict[int, np.ndarray] = {}
+            if prev_state.tracks is not None and prev_state.tracks.tracker_id is not None:
+                for tid, bbox in zip(prev_state.tracks.tracker_id, prev_state.tracks.xyxy):
+                    if int(tid) != -1:
+                        last_bboxes[int(tid)] = bbox
+            self._reid_matcher.notify_lost(lost_ids, last_bboxes)
+
+        # Re-ID: match new IDs against the gallery
+        if new_ids and seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
+            bboxes_dict: dict[int, np.ndarray] = {
+                int(tid): bbox
+                for tid, bbox in zip(seg_result.tracks.tracker_id, seg_result.tracks.xyxy)
+                if int(tid) != -1
+            }
+            remap = self._reid_matcher.rematch(new_ids, frame, bboxes_dict)
+            if remap:
+                seg_result = self._apply_id_remap(seg_result, remap)
+                # Recompute cur_track_ids after applying remap
+                if seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
+                    cur_track_ids = {
+                        int(tid)
+                        for tid in seg_result.tracks.tracker_id
+                        if int(tid) != -1
+                    }
+
+        # Update active appearance models for all visible players
+        if seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
+            for tid, bbox in zip(seg_result.tracks.tracker_id, seg_result.tracks.xyxy):
+                if int(tid) != -1:
+                    self._reid_matcher.update_active(int(tid), frame, bbox)
+
+        # Age gallery entries; prune those that have been absent too long
+        self._reid_matcher.age_gallery(cur_track_ids)
+
+        # Record current IDs for next-frame comparison
+        self._reid_prev_track_ids = cur_track_ids
+
+        return seg_result

@@ -1,14 +1,25 @@
 # Identification Quality Improvement Plan
 
-> **Status: IMPROVEMENTS 1 + 2 + 3 + 4 + 6 + 7 IMPLEMENTED.**
+> **Status: IMPROVEMENTS 1 + 2 + 3 + 4 + 5 + 6 + 7 IMPLEMENTED.**
 >
 > Improvements 5 (Appearance Re-ID / OSNet) and 8 (custom standalone Kalman
-> tracker) were not approved and remain unimplemented.
+> tracker) were not approved in a prior session.  **Improvement 5 has now been
+> implemented** as a lightweight CPU-only HSV-histogram gallery
+> (`segmentation_tracking/appearance_reid.py`) that re-assigns original player
+> IDs after 1–3 second occlusions.
 >
-> See `segmentation_tracking/ball_kalman.py`, `segmentation_tracking/team_classifier.py`,
-> and the updated `segmentation_tracking/segmentation_model.py`,
-> `segmentation_tracking/association.py`, `segmentation_tracking/visualization.py`,
-> and `scripts/run_segmentation_pose_tracking.py` for the changes.
+> Additionally, a critical bug was fixed: `bot_tracks` returned by BoT-SORT
+> were previously computed but discarded — the pipeline always fell through to
+> the YOLO-only `_fallback_detect` path, rendering BoT-SORT Kalman filtering
+> and persistent IDs ineffective.  The main loop now correctly uses
+> `_tracks_to_state` to convert BoT-SORT results into `TrackerState`, with
+> `_fallback_detect` reserved for the case where BoT-SORT returns no tracks.
+>
+> `max_age` default has been increased from 30 → 90 frames (3 s at 30 fps).
+>
+> See `segmentation_tracking/appearance_reid.py` for the new Re-ID module,
+> `segmentation_tracking/segmentation_model.py` for the bug fix and integration,
+> and `tests/test_appearance_reid.py` for 29 new unit tests.
 
 ---
 
@@ -346,7 +357,7 @@ broadcast footage.  Suitable starting points:
 | 2 | **A** – Hungarian matching | `association.py`, `segmentation_model.py` | ✅ Implemented |
 | 3 | **G** – Track lifecycle management | `segmentation_model.py` | ✅ Implemented |
 | 4 | **D** – Camera-motion compensation | `segmentation_model.py` | ✅ Implemented |
-| 5 | **B** – Appearance Re-ID (OSNet) | new `reid_model.py` | ⏸ Not approved |
+| 5 | **B** – Appearance Re-ID (HSV gallery) | new `appearance_reid.py` | ✅ Implemented |
 | 6 | **H** – Ball Kalman filter | `ball_kalman.py`, `segmentation_model.py` | ✅ Implemented |
 | 7 | **F** – Team color clustering | `team_classifier.py` | ✅ Implemented |
 | 8 | **C** – Custom Kalman filter (if not using BoT-SORT) | new `kalman_tracker.py` | ⏸ Not approved |
