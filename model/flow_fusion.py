@@ -8,7 +8,7 @@ class FlowFusion(nn.Module):
         super().__init__()
         self.flow_dim = flow_dim
         # InstanceNorm2d normalises each [H, W] map independently per channel
-        # per sample, so frame i never influences the normalisation of frame j.
+        # per sample, so frame i never influences the normalisation of fame j.
         # This is correct because the B*S leading dimension mixes time steps,
         # and motion statistics vary significantly across frames.
         # affine=True adds learnable scale/shift so the network can adjust range.

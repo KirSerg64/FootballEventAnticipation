@@ -343,7 +343,7 @@ def build_engine(
 
     with open(engine_path, "wb") as f:
         f.write(serialized)
-    size_mb = serialized.size / 1e6
+    size_mb = serialized.size() / 1e6
     print(f"[INFO] TRT engine saved → {engine_path}  ({size_mb:.1f} MB)")
 
 
