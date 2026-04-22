@@ -630,7 +630,7 @@ class FrameReader:
                 pad_start += 1
                 continue
 
-            if pad_end > 0:
+            if found_start != -1 and pad_end > 0:
                 pad_end += 1
                 continue
             
@@ -674,7 +674,10 @@ class FrameReader:
                 found_start = frame
 
             if not exist_frame:
-                pad_end += 1
+                if found_start == -1:
+                    pad_start += 1
+                else:
+                    pad_end += 1
 
         ret = [base_path, found_start, pad_start, pad_end, ndigits, (end-start) // stride]
 
