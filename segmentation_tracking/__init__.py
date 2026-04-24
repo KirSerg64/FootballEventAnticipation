@@ -12,6 +12,7 @@ Modules:
     ball_kalman         -- Detection-first + MOSSE DCF ball tracker (BallDCFTracker); FRoG-MOT motion-state; UKF retained for compat
     team_classifier     -- HSV K-means and SIGLIP-embedding team classifiers
     vector_field        -- Player velocity tracking and vector-field attractor estimation
+    yolo_features       -- Zero-cost YOLO backbone feature extraction via forward hook
 """
 
 from segmentation_tracking.segmentation_model import SegmentationTracker, TrackerState
@@ -23,6 +24,7 @@ from segmentation_tracking.ball_kalman import BallKalmanFilter, AdaptiveBallKalm
 from segmentation_tracking.team_classifier import TeamClassifier, SiglipTeamClassifier, create_team_classifier
 from segmentation_tracking.vector_field import PlayerVelocityTracker, KeypointVelocityTracker, AttractorEstimate, estimate_attractor, AttractorSmoother, CameraMotionCompensator
 from segmentation_tracking.appearance_reid import AppearanceReIDMatcher
+from segmentation_tracking.yolo_features import YOLOFeatureExtractor
 
 __all__ = [
     "SegmentationTracker",
@@ -48,4 +50,5 @@ __all__ = [
     "AttractorSmoother",
     "CameraMotionCompensator",
     "AppearanceReIDMatcher",
+    "YOLOFeatureExtractor",
 ]

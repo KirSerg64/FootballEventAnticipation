@@ -22,20 +22,31 @@ Design rationale
   entries do not cause false matches (default 90 frames ≈ 3 s at 30 fps).
 * **Hungarian assignment** is used when multiple new IDs could match the same
   gallery entry; the globally optimal 1-to-1 assignment is selected.
+* **YOLO backbone features** (optional): when the caller provides per-track
+  L2-normalised FPN feature vectors extracted by
+  :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`, these
+  are stored alongside the HSV histogram and blended into the similarity score
+  during re-matching.  The blend weight is controlled by ``yolo_feat_weight``.
+  When YOLO features are unavailable for either gallery or candidate track, the
+  matcher falls back to HSV-only similarity seamlessly.
 
 Public API
 ~~~~~~~~~~
-``AppearanceReIDMatcher(gallery_ttl, similarity_threshold)``
+``AppearanceReIDMatcher(gallery_ttl, similarity_threshold, yolo_feat_weight)``
     Constructor.
 
-``update_active(track_id, frame, bbox)``
+``update_active(track_id, frame, bbox, yolo_feat=None)``
     Call every frame for each visible track to maintain its appearance model.
+    ``yolo_feat`` is an optional L2-normalised float32 feature vector from
+    :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`.
 
 ``notify_lost(lost_ids, last_bboxes)``
     Call when tracks disappear; moves their appearance into the gallery.
 
-``rematch(new_track_ids, frame, bboxes) -> dict[int, int]``
+``rematch(new_track_ids, frame, bboxes, yolo_feats=None) -> dict[int, int]``
     Returns ``{new_id: old_id}`` for IDs that were successfully re-identified.
+    ``yolo_feats`` is an optional ``{track_id: feature_vector}`` dict for the
+    candidate new tracks.
 
 ``age_gallery(current_track_ids)``
     Ages gallery entries and removes expired ones.  Call at end of each frame.
@@ -83,9 +94,10 @@ class _GalleryEntry:
     """Appearance record for a recently-lost track."""
 
     track_id: int
-    histogram: np.ndarray     # normalised, unit-L2 flat float32 array
-    last_bbox: np.ndarray     # [x1, y1, x2, y2] at time of disappearance
-    frames_absent: int = 0    # incremented each frame the track is absent
+    histogram: np.ndarray            # normalised, unit-L2 flat float32 array
+    last_bbox: np.ndarray            # [x1, y1, x2, y2] at time of disappearance
+    frames_absent: int = 0           # incremented each frame the track is absent
+    yolo_feat: np.ndarray | None = None  # optional L2-normalised YOLO feature vector
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +107,10 @@ class _GalleryEntry:
 class AppearanceReIDMatcher:
     """Re-identify players after occlusions using HSV appearance histograms.
 
+    Optionally blends in YOLO backbone feature vectors (from
+    :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`) to
+    improve discrimination when two players share similar jersey colours.
+
     Parameters
     ----------
     gallery_ttl:
@@ -103,18 +119,28 @@ class AppearanceReIDMatcher:
     similarity_threshold:
         Minimum cosine similarity ``[0, 1]`` required to accept a gallery
         match.  Higher is more conservative; default ``0.85``.
+    yolo_feat_weight:
+        Blend weight for YOLO feature similarity vs. HSV histogram similarity
+        when both are available.  ``0.0`` → HSV only; ``1.0`` → YOLO only;
+        default ``0.5`` (equal blend).  When YOLO features are absent for
+        either gallery entry or candidate, the matcher silently falls back to
+        HSV-only similarity regardless of this setting.
     """
 
     def __init__(
         self,
         gallery_ttl: int = 90,
         similarity_threshold: float = 0.85,
+        yolo_feat_weight: float = 0.5,
     ) -> None:
         self.gallery_ttl = gallery_ttl
         self.similarity_threshold = similarity_threshold
+        self.yolo_feat_weight = float(np.clip(yolo_feat_weight, 0.0, 1.0))
 
         # active_hists: running appearance model per currently-visible track
         self._active_hists: dict[int, np.ndarray] = {}
+        # active_yolo_feats: latest YOLO feature vector per active track (optional)
+        self._active_yolo_feats: dict[int, np.ndarray] = {}
         # gallery: old_track_id → GalleryEntry for recently-lost tracks
         self._gallery: dict[int, _GalleryEntry] = {}
 
@@ -125,6 +151,7 @@ class AppearanceReIDMatcher:
     def reset(self) -> None:
         """Clear all state (call at the start of each new video)."""
         self._active_hists.clear()
+        self._active_yolo_feats.clear()
         self._gallery.clear()
 
     def update_active(
@@ -132,6 +159,7 @@ class AppearanceReIDMatcher:
         track_id: int,
         frame: np.ndarray,
         bbox: np.ndarray,
+        yolo_feat: np.ndarray | None = None,
     ) -> None:
         """Update the rolling appearance model for an active track.
 
@@ -146,6 +174,12 @@ class AppearanceReIDMatcher:
             Current BGR frame.
         bbox:
             ``[x1, y1, x2, y2]`` bounding box for the player.
+        yolo_feat:
+            Optional L2-normalised float32 YOLO backbone feature vector
+            for this player in this frame, as produced by
+            :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`.
+            When provided, it is stored (replacing any previous value) and
+            will be carried into the gallery when the track disappears.
         """
         hist = self._extract_histogram(frame, bbox)
         if hist is None:
@@ -160,6 +194,10 @@ class AppearanceReIDMatcher:
             norm = np.linalg.norm(self._active_hists[track_id])
             if norm > 1e-6:
                 self._active_hists[track_id] /= norm
+
+        # Store the latest YOLO feature (most recent frame overwrites previous)
+        if yolo_feat is not None:
+            self._active_yolo_feats[track_id] = yolo_feat
 
     def notify_lost(
         self,
@@ -178,6 +216,7 @@ class AppearanceReIDMatcher:
         """
         for tid in lost_ids:
             hist = self._active_hists.pop(tid, None)
+            yolo_feat = self._active_yolo_feats.pop(tid, None)
             if hist is None:
                 continue
             bbox = last_bboxes.get(tid)
@@ -187,6 +226,7 @@ class AppearanceReIDMatcher:
                 track_id=tid,
                 histogram=hist.copy(),
                 last_bbox=bbox.copy(),
+                yolo_feat=yolo_feat.copy() if yolo_feat is not None else None,
             )
             logger.debug("ReID gallery: track %d added (gallery size=%d)", tid, len(self._gallery))
 
@@ -195,6 +235,7 @@ class AppearanceReIDMatcher:
         new_track_ids: list[int],
         frame: np.ndarray,
         bboxes: dict[int, np.ndarray],
+        yolo_feats: dict[int, np.ndarray] | None = None,
     ) -> dict[int, int]:
         """Match newly-issued track IDs against the lost-track gallery.
 
@@ -211,12 +252,19 @@ class AppearanceReIDMatcher:
         bboxes:
             ``{track_id: bbox}`` for all current tracks (used to extract
             histogram for new IDs).
+        yolo_feats:
+            Optional ``{track_id: feature_vector}`` mapping for new tracks,
+            as produced by
+            :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`.
+            When provided for both the candidate and the gallery entry, the
+            similarity is a weighted blend:
+            ``(1 - yolo_feat_weight) * hsv_sim + yolo_feat_weight * yolo_sim``.
 
         Returns
         -------
         ``{new_id: old_id}`` mapping — apply this by replacing ``new_id``
         entries with ``old_id`` in the tracking results.  Only entries with
-        similarity ≥ ``similarity_threshold`` are included.
+        blended similarity ≥ ``similarity_threshold`` are included.
         """
         if not new_track_ids or not self._gallery:
             return {}
@@ -225,7 +273,7 @@ class AppearanceReIDMatcher:
         n_new = len(new_track_ids)
         n_gal = len(gallery_ids)
 
-        # Build new-ID histograms
+        # Build new-ID HSV histograms
         new_hists: list[np.ndarray | None] = []
         for nid in new_track_ids:
             bbox = bboxes.get(nid)
@@ -233,13 +281,30 @@ class AppearanceReIDMatcher:
                 self._extract_histogram(frame, bbox) if bbox is not None else None
             )
 
-        # Build cosine similarity matrix
+        # Build combined similarity matrix
         sim_matrix = np.full((n_new, n_gal), -1.0, dtype=np.float64)
-        for i, hist in enumerate(new_hists):
+        w = self.yolo_feat_weight
+
+        for i, (nid, hist) in enumerate(zip(new_track_ids, new_hists)):
             if hist is None:
                 continue
+            new_yolo = yolo_feats.get(nid) if yolo_feats else None
             for j, gid in enumerate(gallery_ids):
-                sim = float(np.dot(hist, self._gallery[gid].histogram))
+                entry = self._gallery[gid]
+                hsv_sim = float(np.dot(hist, entry.histogram))
+
+                # Blend in YOLO similarity when both sides have features
+                if (
+                    w > 0.0
+                    and new_yolo is not None
+                    and entry.yolo_feat is not None
+                    and new_yolo.shape == entry.yolo_feat.shape
+                ):
+                    yolo_sim = float(np.dot(new_yolo, entry.yolo_feat))
+                    sim = (1.0 - w) * hsv_sim + w * yolo_sim
+                else:
+                    sim = hsv_sim
+
                 sim_matrix[i, j] = sim
 
         # Hungarian assignment on the cost matrix (cost = 1 - similarity)

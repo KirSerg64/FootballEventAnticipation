@@ -303,6 +303,10 @@ class SegmentationTracker:
         enable_reid: bool = True,
         reid_gallery_ttl: int = 90,
         reid_similarity_threshold: float = 0.85,
+        reid_yolo_feat_weight: float = 0.5,
+        # YOLO backbone feature extraction for Re-ID (zero extra compute)
+        enable_yolo_features: bool = True,
+        yolo_feat_scale_idx: int = 1,
     ) -> None:
         self._sam_config = sam_model_config
         self._sam_checkpoint = sam_model_checkpoint
@@ -355,11 +359,16 @@ class SegmentationTracker:
             AppearanceReIDMatcher(
                 gallery_ttl=reid_gallery_ttl,
                 similarity_threshold=reid_similarity_threshold,
+                yolo_feat_weight=reid_yolo_feat_weight,
             )
             if enable_reid
             else None
         )
         self._reid_prev_track_ids: set[int] = set()
+        # YOLO backbone feature extractor (lazy-init once detector is loaded)
+        self._enable_yolo_features: bool = enable_yolo_features and enable_reid
+        self._yolo_feat_scale_idx: int = yolo_feat_scale_idx
+        self._feat_extractor = None   # YOLOFeatureExtractor, set in _get_detector()
 
         self._sam_tracker = None
         # Path to customised tracker YAML written at init time
@@ -368,6 +377,14 @@ class SegmentationTracker:
 
     def __del__(self) -> None:
         """Remove the temporary tracker config file on garbage collection."""
+        # Unregister the YOLO feature extractor hook to avoid dangling references
+        feat_ext = getattr(self, "_feat_extractor", None)
+        if feat_ext is not None:
+            try:
+                feat_ext.remove()
+            except Exception:
+                pass
+
         path = getattr(self, "_tracker_config_path", None)
         if path and os.path.isfile(path):
             try:
@@ -399,6 +416,26 @@ class SegmentationTracker:
             from ultralytics import YOLO
             logger.info("Loading YOLO detection model: %s", self.det_model_path)
             self._detector = YOLO(self.det_model_path)
+            # Attach the YOLO feature extractor hook (zero extra compute)
+            if self._enable_yolo_features and self._reid_matcher is not None:
+                try:
+                    from segmentation_tracking.yolo_features import YOLOFeatureExtractor
+                    self._feat_extractor = YOLOFeatureExtractor(
+                        self._detector,
+                        scale_idx=self._yolo_feat_scale_idx,
+                    )
+                    logger.info(
+                        "YOLO feature extractor enabled (scale_idx=%d, stride=%d)",
+                        self._yolo_feat_scale_idx,
+                        8 * (2 ** self._yolo_feat_scale_idx),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "YOLO feature extractor could not be initialised (%s); "
+                        "Re-ID will use HSV histograms only.",
+                        exc,
+                    )
+                    self._feat_extractor = None
         return self._detector
 
     def _get_sam_predictor(self) -> SAM2Tracker:
@@ -453,13 +490,18 @@ class SegmentationTracker:
 
     def _track_frame(
         self, frame: np.ndarray
-    ) -> tuple[dict[int, np.ndarray], np.ndarray | None]:
+    ) -> tuple[dict[int, np.ndarray], np.ndarray | None, dict[int, np.ndarray]]:
         """Run one frame through BoT-SORT and detect the ball.
 
         A single YOLO forward pass covers both person tracking (class 0)
         and ball detection (class 32).  Person detections carry persistent
         BoT-SORT IDs; ball detections are returned as a raw bbox (the
         correlation tracker processes them in :meth:`_process_ball`).
+
+        If a :class:`~segmentation_tracking.yolo_features.YOLOFeatureExtractor`
+        is attached, per-player FPN feature vectors are extracted from the same
+        forward pass at zero additional GPU cost and returned as a
+        ``{track_id: feature_vec}`` dict.
 
         Returns
         -------
@@ -468,6 +510,10 @@ class SegmentationTracker:
         ball_bbox:
             ``[x1, y1, x2, y2]`` for the highest-confidence ball detection,
             or *None*.
+        yolo_feats:
+            ``{track_id: feature_vec}`` of L2-normalised FPN feature vectors
+            for each player track.  Empty dict when the extractor is disabled
+            or unavailable.
         """
         det = self._get_detector()
         # When no dedicated ball model is configured, detect the ball in the
@@ -523,7 +569,20 @@ class SegmentationTracker:
                         ball_bbox = box.xyxy[0].cpu().numpy().astype(np.float32)
                         best_ball_conf = conf
 
-        return player_tracks, ball_bbox
+        # Extract per-player YOLO backbone features captured by the forward hook.
+        # The hook fired during det.track() above; we pool features here and then
+        # clear the stored tensors so they are not held across frames.
+        yolo_feats: dict[int, np.ndarray] = {}
+        if self._feat_extractor is not None and player_tracks:
+            frame_hw = (frame.shape[0], frame.shape[1])
+            tids = list(player_tracks.keys())
+            bboxes = [player_tracks[tid] for tid in tids]
+            vecs = self._feat_extractor.extract_roi_features(bboxes, frame_hw)
+            for tid, vec in zip(tids, vecs):
+                yolo_feats[tid] = vec
+            self._feat_extractor.clear()
+
+        return player_tracks, ball_bbox, yolo_feats
 
     # -- YOLO helpers (fallback / re-detection only) --------------------------
 
@@ -1272,7 +1331,7 @@ class SegmentationTracker:
             seg_result.homography = homography
 
             # BoT-SORT tracking + ball detection
-            bot_tracks, ball_bbox_raw = self._track_frame(frame)
+            bot_tracks, ball_bbox_raw, yolo_feats = self._track_frame(frame)
 
             # Field-mask filter: discard player tracks not standing on the pitch
             if self.field_mask_filter and self._cached_field_mask is not None and bot_tracks:
@@ -1301,7 +1360,7 @@ class SegmentationTracker:
 
             # -- Appearance-based Re-ID (recover IDs after long occlusions) ---
             if self._reid_matcher is not None:
-                seg_result = self._run_reid(seg_result, frame, results)
+                seg_result = self._run_reid(seg_result, frame, results, yolo_feats=yolo_feats)
 
             # Ball correlation tracker (detection-first + MOSSE gap fill)
             seg_result = self._process_ball(frame, ball_bbox_raw, seg_result)
@@ -1323,6 +1382,7 @@ class SegmentationTracker:
         seg_result: TrackerState,
         frame: np.ndarray,
         previous_results: list[TrackerState],
+        yolo_feats: dict[int, np.ndarray] | None = None,
     ) -> TrackerState:
         """Run one iteration of the appearance Re-ID pipeline.
 
@@ -1345,6 +1405,11 @@ class SegmentationTracker:
         previous_results:
             All previously-processed frames (used to retrieve last bboxes of
             lost tracks).
+        yolo_feats:
+            Optional ``{track_id: feature_vec}`` from
+            :meth:`_track_frame`.  When provided, YOLO backbone features are
+            stored with each active track and blended into the Re-ID similarity
+            score (see :class:`~segmentation_tracking.appearance_reid.AppearanceReIDMatcher`).
 
         Returns
         -------
@@ -1381,7 +1446,9 @@ class SegmentationTracker:
                 for tid, bbox in zip(seg_result.tracks.tracker_id, seg_result.tracks.xyxy)
                 if int(tid) != -1
             }
-            remap = self._reid_matcher.rematch(new_ids, frame, bboxes_dict)
+            remap = self._reid_matcher.rematch(
+                new_ids, frame, bboxes_dict, yolo_feats=yolo_feats
+            )
             if remap:
                 seg_result = self._apply_id_remap(seg_result, remap)
                 # Recompute cur_track_ids after applying remap
@@ -1392,11 +1459,18 @@ class SegmentationTracker:
                         if int(tid) != -1
                     }
 
-        # Update active appearance models for all visible players
+        # Update active appearance models for all visible players,
+        # passing YOLO features when available so they are carried into
+        # the gallery on the next disappearance.
         if seg_result.tracks is not None and seg_result.tracks.tracker_id is not None:
             for tid, bbox in zip(seg_result.tracks.tracker_id, seg_result.tracks.xyxy):
                 if int(tid) != -1:
-                    self._reid_matcher.update_active(int(tid), frame, bbox)
+                    self._reid_matcher.update_active(
+                        int(tid),
+                        frame,
+                        bbox,
+                        yolo_feat=yolo_feats.get(int(tid)) if yolo_feats else None,
+                    )
 
         # Age gallery entries; prune those that have been absent too long
         self._reid_matcher.age_gallery(cur_track_ids)
