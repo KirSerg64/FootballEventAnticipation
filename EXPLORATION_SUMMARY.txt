@@ -1,0 +1,370 @@
+================================================================================
+FOOTBALL EVENT ANTICIPATION REPOSITORY - EXPLORATION SUMMARY
+================================================================================
+
+REPOSITORY: https://github.com/KirSerg64/FootballEventAnticipation
+PAPER: "Action Anticipation from SoccerNet Football Video Broadcasts" (CVPR 2025)
+MAIN BRANCH: train
+AUTHOR: Kirill <KirSerg32@yandex.ru>
+
+================================================================================
+1. DIRECTORY STRUCTURE
+================================================================================
+
+Core Files (Entry Points):
+  • main.py              - Main training orchestrator
+  • train.py             - Training loop (36KB)
+  • train_dual.py        - Joint training with auxiliary tasks
+  • test.py              - Model evaluation script
+  • eval.py              - Evaluation metrics (20KB)
+  • eval_BAA.py          - BAA-specific evaluation (19KB)
+  • opts.py              - Configuration management (8.5KB)
+  • utils.py             - Utility functions (9.5KB)
+
+Model Architecture:
+  • model/futr.py        - FUTR transformer model (223 lines)
+  • model/extras/transformer.py - Encoder/decoder (287 lines)
+  • model/extras/position.py    - Positional encoding (37 lines)
+  • model/T_Deed_Modules/ - Temporal enhancement modules (1159 lines total)
+
+Dataset & Data Loading:
+  • dataset/frame.py     - Frame dataset classes (979 lines)
+  • dataset/datasets.py  - Dataset factory (179 lines)
+  • util/io.py           - JSON/file utilities (56 lines)
+  • util/dataset.py      - Class loading (7 lines)
+
+Dataset Setup:
+  • setup_dataset_BAA.py - Ball Action Anticipation setup
+  • setup_dataset_BAS.py - Ball Action Spotting setup
+  • setup_dataset_BAA_sample.py - BAA sample setup
+
+Utilities:
+  • visualize_clip_actions.py - Action visualization
+  • update_split_json.py - Dataset split management
+  • shard_and_compress_data.py - Data compression
+
+Configuration:
+  • config/SoccerNetBall/ - JSON config templates
+    - Base-Config-BAA.json (Ball Action Anticipation)
+    - Base-Config-BAS.json (Ball Action Spotting)
+    - Base-Config-Joint.json (Joint training)
+    - Base-Config-BAA_Test01.json (Test config)
+
+Data Metadata:
+  • data/soccernetballanticipation/ - BAA dataset metadata
+  • data/soccernetball/ - BAS dataset metadata
+  • data/soccernet/ - SoccerNet v2 metadata
+
+Documentation:
+  • README.md - Main project documentation
+  • ChallengeRules.md - Challenge submission rules
+  • requirements.txt - Python dependencies
+
+================================================================================
+2. KEY FEATURES & CAPABILITIES
+================================================================================
+
+MODEL ARCHITECTURE (FUTR):
+  - Backbone: RegNetY (rny002, rny004, rny006, rny008) from TIMM
+  - Temporal Processing: Optional T-Deed modules (EDSGP-Mixer) for enhanced temporal discrimination
+  - Transformer: 6-layer encoder + 6-layer decoder (configurable)
+  - Multi-task: Action anticipation + segmentation + actionness
+  - Output Heads:
+    * Action classification (batch, n_query, n_classes)
+    * Temporal offset prediction (batch, n_query)
+    * Optional: Actionness scores (batch, n_query)
+    * Optional: Frame-level segmentation (batch, frames, n_classes)
+
+DATASET SUPPORT:
+  1. SoccerNet v2 - General action spotting
+  2. Ball Action Spotting (BAS) - Ball-centric event detection
+  3. Ball Action Anticipation (BAA) - Novel anticipation dataset
+  
+  Features:
+  - Clip-based sampling with configurable stride/overlap
+  - Variable observation percentages (e.g., [0.2, 0.3, 0.5])
+  - Per-clip ground truth action labels with temporal offsets
+  - Class weighting and exclusion
+  - Label smoothing and augmentation
+  - Support for joint training on multiple datasets
+
+TRAINING FEATURES:
+  - Dual optimizer: AdamW + Muon (experimental)
+  - LR Scheduler: Linear warmup + Cosine annealing
+  - Loss functions: CrossEntropy, label smoothing, BCE
+  - CALF matching: Hungarian algorithm for action reordering
+  - Checkpoint management: Periodic saves + best model tracking
+  - Weights & Biases integration for logging
+  - Gradient computation with optional masking
+
+EVALUATION METRICS:
+  - mAP@δ: Mean average precision at temporal delta δ
+  - mAP@∞: Occurrence within anticipation window
+  - Per-class F1 scores
+  - Accuracy and error statistics
+  - Class-wise TP/FP/FN/TN analysis
+
+================================================================================
+3. PYTHON DEPENDENCIES
+================================================================================
+
+Core (requirements.txt):
+  • numpy>=1.26.4 - Numerical computing
+  • scipy>=1.15.3 - Scientific computing
+  • torch>=2.0.0 - Deep learning (tested with 2.8.0)
+  • einops>=0.8.1 - Tensor operations
+  • timm>=1.0.19 - Vision models (backbone source)
+  • SoccerNet>=0.1.62 - SoccerNet evaluation API
+  • wandb>=0.21.1 - Experiment tracking
+  • tabulate>=0.9.0 - Pretty printing
+  • pyzipper>=0.3.6 - Password-protected ZIP handling
+
+Pose Estimation (requirements_pose.txt):
+  • torch>=2.0.0
+  • torchvision>=0.15.0
+  • opencv-python>=4.7.0
+  • numpy>=1.24.0
+  • Optional: mmcv, mmdet, mmpose (for BBoxMaskPose backend)
+
+================================================================================
+4. BRANCHES & IMPLEMENTATIONS
+================================================================================
+
+1. TRAIN (Default)
+   - Full FAANTRA implementation
+   - Action anticipation + segmentation
+   - Multiple dataset support (BAS, BAA, SoccerNet)
+   - Production-ready code
+   - Tested on torch 2.8.0 (NGC container) on 27/08/2025
+
+2. copilot/pose-estimation-experiment
+   - Player pose estimation pipeline
+   - Two backends:
+     * KeypointRCNN (torchvision, default)
+     * BBoxMaskPose (optional, ViTPose-based)
+   - COCO 17-keypoint skeleton support
+   - Skeleton visualization with video output
+   - Files: pose_estimation/, scripts/run_pose_estimation.py
+
+3. copilot/add-instance-segmentation-tracking
+   - Work in progress for instance-level tracking
+
+================================================================================
+5. CONFIGURATION SYSTEM
+================================================================================
+
+Each config JSON includes:
+
+Paths:
+  • frame_dir: Input frame directory
+  • save_dir: Checkpoint save location
+  • store_dir: Cache directory for dataset preprocessing
+
+Dataset:
+  • dataset: "soccernetballanticipation", "soccernetball", or "soccernet"
+  • clip_len: 750 (frames per clip)
+  • epoch_num_frames: Total frames per epoch (e.g., 18000)
+  • batch_size: Batch size for training
+  • num_workers: DataLoader workers
+
+Architecture:
+  • feature_arch: "rny002", "rny004", "rny006", or "rny008"
+  • temporal_arch: "ed_sgp_mixer" or "none"
+  • n_head: 8 (attention heads)
+  • hidden_dim: 256 (hidden dimension)
+  • n_encoder_layer: 6 (encoder depth)
+  • n_decoder_layer: 6 (decoder depth)
+  • n_query: 8 (max predictions per frame)
+
+Training:
+  • num_epochs: 100
+  • learning_rate: 0.001
+  • optimizer: "adamw" or "muon"
+  • weight_decay: 0.05
+  • warm_up_epochs: Number of warmup epochs
+
+Task Configuration:
+  • obs_perc: [0.2, 0.3, 0.5] (observation window percentages)
+  • pred_perc: 0.3 (prediction/anticipation window percentage)
+  • seg: true/false (auxiliary segmentation task)
+  • anticipate: true/false (action anticipation task)
+  • actionness: true/false (use actionness instead of EOS)
+  • use_anchors: true/false (temporal anchor prediction)
+
+Advanced:
+  • CALF_matching: true/false (Hungarian algorithm for action reordering)
+  • mask_attn: true/false (attention masking)
+  • offset_loss_weight: 1.0 (temporal offset loss scaling)
+  • class_weights: Per-class loss weighting
+
+================================================================================
+6. WORKFLOW - TRAINING TO EVALUATION
+================================================================================
+
+Step 1: SETUP
+  $ python setup_dataset_BAA.py --download-key YOUR_NDA_KEY
+  $ pip install -r requirements.txt
+
+Step 2: TRAINING
+  $ python main.py config/SoccerNetBall/Base-Config-BAA.json my_model_v1
+  Output: Checkpoints in my_model_v1/ directory
+          Logs in wandb (if online mode)
+
+Step 3: EVALUATION
+  $ python test.py config/SoccerNetBall/Base-Config-BAA.json \
+                   my_model_v1/model/transformer/best_model.pth \
+                   my_model_v1 -s test
+  Output: Metrics (mAP@δ, mAP@∞, F1, etc.)
+          Predictions saved as .npy files
+
+Step 4: CHALLENGE SUBMISSION (optional)
+  $ python test.py config/SoccerNetBall/Base-Config-BAA.json \
+                   my_model_v1/model/transformer/best_model.pth \
+                   my_model_v1 -s challenge
+  Output: Challenge submission format
+
+================================================================================
+7. POSE ESTIMATION (EXPERIMENTAL BRANCH)
+================================================================================
+
+Setup:
+  $ git checkout copilot/pose-estimation-experiment
+  $ pip install -r requirements_pose.txt
+
+Basic Usage:
+  $ python scripts/run_pose_estimation.py \
+      --input video.mp4 \
+      --output output.mp4 \
+      --device cuda
+
+Advanced Usage (BBoxMaskPose):
+  $ python scripts/run_pose_estimation.py \
+      --input video.mp4 \
+      --output output.mp4 \
+      --backend bboxmaskpose \
+      --bbox_config config.py \
+      --bbox_checkpoint weights.pth \
+      --det_config det_config.py \
+      --det_checkpoint det_weights.pth
+
+Features:
+  - COCO 17-keypoint skeleton (nose, eyes, ears, shoulders, elbows, 
+    wrists, hips, knees, ankles)
+  - Two backends: KeypointRCNN (default) or BBoxMaskPose (high accuracy)
+  - Support for video files or frame directories
+  - Adjustable confidence thresholds
+  - Visualization options (bboxes, confidence scores)
+
+================================================================================
+8. KEY UTILITY FUNCTIONS (utils.py)
+================================================================================
+
+Loss Calculation:
+  • cal_loss() - CrossEntropy, smoothing, or BCE with class weighting
+  • cal_performance() - Accuracy metrics and per-class statistics
+  • cal_actionness_performance() - Binary classification metrics
+
+Matching Algorithms:
+  • CALF_matching() - Hungarian algorithm for offset-based action matching
+  • CALF_matching2() - Probability-weighted matching with actionness
+
+Helpers:
+  • seed_everything() - Reproducible randomization
+  • normalize_offset() - Temporal offset normalization
+
+Loss Functions Supported:
+  • "CE" - Standard cross-entropy
+  • "smoothing" - Label smoothing (eps=0.1)
+  • "BCE" - Binary cross-entropy (for multi-label)
+
+================================================================================
+9. IMPORTANT NOTES
+================================================================================
+
+Dataset Limitations:
+  - BAA dataset requires NDA from https://www.soccer-net.org/data
+  - FFmpeg required for frame extraction
+  - ~100+ GB storage needed for full dataset with frames
+  - SoccerNet v2 data access also requires NDA
+
+Model Checkpoints:
+  - Training checkpoints: Saved every epoch (with optimizer/scheduler state)
+  - Best model checkpoint: Only weights saved (best mAP)
+  - Can resume training from any epoch checkpoint
+
+Evaluation:
+  - Predictions are clipped-based
+  - Metrics calculated per game/video
+  - Challenge splits have slightly different evaluation protocol
+  - Test split evaluation creates .npy prediction files for debugging
+
+Performance:
+  - Code tested on NVIDIA NGC PyTorch container (torch 2.8.0a0)
+  - GPU recommended (tested on NVIDIA A100)
+  - CPU mode available for small-scale testing
+
+Reproducibility:
+  - All randomization can be controlled via seed
+  - Deterministic=true removes non-deterministic operations
+  - Config fully specifies model and training
+
+================================================================================
+10. FILES SAVED BY THIS EXPLORATION
+================================================================================
+
+1. REPOSITORY_EXPLORATION.md
+   - Complete directory structure with descriptions
+   - Core components explanation
+   - Configuration system details
+   - Main pipeline workflow
+   - Evaluation metrics overview
+   - References and citations
+
+2. CODE_EXAMPLES.md
+   - Quick start guide
+   - Training examples with different configurations
+   - Evaluation commands
+   - Dataset setup instructions
+   - Model inspection code
+   - Data loading examples
+   - Pose estimation examples
+   - Loss function and metric computation
+   - Debugging utilities
+
+3. EXPLORATION_SUMMARY.txt (this file)
+   - High-level overview
+   - Key statistics and file information
+   - Workflow summary
+   - Important notes and limitations
+
+================================================================================
+11. QUICK REFERENCE - MOST IMPORTANT FILES
+================================================================================
+
+To understand the codebase, read in this order:
+
+1. opts.py (114 lines) - Understand all configuration options
+2. main.py (234 lines) - Training orchestration
+3. model/futr.py (223 lines) - Model architecture
+4. train.py (36KB) - Training loop details
+5. dataset/frame.py (979 lines) - Data loading mechanism
+6. eval.py (20KB) - Evaluation metrics
+7. utils.py (9.5KB) - Loss functions and utilities
+
+For specific tasks:
+- Training: main.py -> main()
+- Evaluation: test.py or eval.py
+- Data Loading: dataset/datasets.py -> get_datasets()
+- Model Creation: model/futr.py -> FUTR class
+- Configuration: opts.py -> update_args()
+
+================================================================================
+TOTAL CODEBASE SIZE:
+- Python files: ~4,200 lines of code
+- Configuration templates: 4 JSON files
+- Documentation: README.md, ChallengeRules.md, config/README.md
+- Data metadata: JSON splits for 3 datasets
+
+Last tested: August 27, 2025
+PyTorch version: 2.8.0a0 (NVIDIA NGC container)
+================================================================================
